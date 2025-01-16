@@ -1,11 +1,21 @@
 // background.js
 import UrlSettingsManager from './urlSettingsManager.js';
+import Logger from './logger.js';
+
+// Loggers for different components
+const logger = new Logger();
+const pollLogger = new Logger('POLL');
+const initLogger = new Logger('INIT');
+const settingsLogger = new Logger('SETTINGS');
+const processLogger = new Logger('PROCESS');
+const statusLogger = new Logger('STATUS');
+const messageLogger = new Logger('MESSAGE');
+const tabLogger = new Logger('TAB');
 
 let pollingInterval = null;
-let currentStatus = 'Idle';
-let currentTab = null;
 let isProcessing = false;
-let currentError = null;
+let currentStatus = 'Idle';
+let lastPollTime = null;
 
 // Initialize URL Settings Manager
 const urlSettingsManager = new UrlSettingsManager(console);
@@ -53,114 +63,86 @@ async function fetchWithTimeout(url, options = {}, timeout = 30000) {
 }
 
 async function processUrl(url) {
-    if (isProcessing) {
-        log('PROCESS', 'Already processing a URL, skipping');
-        return;
-    }
+    const processId = Date.now();
+    processLogger.info(`Starting URL processing ${processId}`, { url });
     
     isProcessing = true;
-    log('PROCESS', `Starting to process URL: ${url}`);
-    
     try {
-        // Close previous tab if exists
-        if (currentTab) {
-            log('TAB', `Closing previous tab: ${currentTab.id}`);
-            try {
-                await chrome.tabs.remove(currentTab.id);
-            } catch (e) {
-                log('TAB_ERROR', 'Error closing previous tab', e);
-            }
-            currentTab = null;
-        }
+        processLogger.debug(`Process ${processId}: Creating tab`);
+        const tab = await chrome.tabs.create({ url, active: false });
         
-        // Create new tab
-        log('TAB', 'Creating new tab');
-        currentTab = await chrome.tabs.create({ url: url, active: true });
-        log('TAB', `Created tab with ID: ${currentTab.id}`);
+        processLogger.debug(`Process ${processId}: Waiting for tab load`);
+        await waitForTabLoad(tab.id);
         
-        // Wait for the page to load
-        log('PAGE', 'Waiting for page to load');
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('Page load timeout after 30s'));
-            }, 30000);
-
-            chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
-                if (tabId === currentTab.id && info.status === 'complete') {
-                    log('PAGE', `Page loaded in tab ${tabId}`);
-                    chrome.tabs.onUpdated.removeListener(listener);
-                    clearTimeout(timeout);
-                    resolve();
-                }
-            });
+        processLogger.debug(`Process ${processId}: Extracting content`);
+        const content = await extractContent(tab.id);
+        
+        processLogger.info(`Process ${processId}: Content extracted`, {
+            titleLength: content.title?.length,
+            contentLength: content.readableContent?.length
         });
-
-        // Wait a bit for dynamic content
-        log('PAGE', 'Waiting for dynamic content');
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        // Extract content
-        log('EXTRACT', 'Starting content extraction');
-        const [result] = await chrome.scripting.executeScript({
-            target: { tabId: currentTab.id },
-            function: () => ({
-                url: window.location.href,
-                title: document.title,
-                content: document.body.innerText,
-                html: document.documentElement.outerHTML
-            })
-        });
-        log('EXTRACT', 'Content extracted successfully', { title: result.result.title });
-
-        // Get control URL from storage
-        const settings = await urlSettingsManager.getStorageSync(defaultSettings);
-        if (!settings.controlUrl) {
-            throw new Error('Control URL not found in settings');
-        }
-
-        // Send results to server
-        log('SUBMIT', `Submitting results to ${settings.controlUrl}/submit`);
-        const submitResponse = await fetch(`${settings.controlUrl}/submit`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                url: url,
-                content: result.result
-            })
-        });
-
-        if (!submitResponse.ok) {
-            throw new Error(`Server responded with ${submitResponse.status}`);
-        }
-
-        log('SUBMIT', 'Results submitted successfully');
-        setStatus(`Successfully processed: ${url}`);
-
+        
+        processLogger.debug(`Process ${processId}: Closing tab`);
+        await chrome.tabs.remove(tab.id);
+        
+        processLogger.info(`Process ${processId}: Processing completed successfully`);
     } catch (error) {
-        log('ERROR', `Failed to process ${url}`, error);
-        setStatus('Error processing URL', error.message);
+        processLogger.error(`Process ${processId} failed`, error);
     } finally {
-        // Cleanup
-        if (currentTab) {
-            try {
-                await chrome.tabs.remove(currentTab.id);
-                log('CLEANUP', `Removed tab ${currentTab.id}`);
-            } catch (e) {
-                log('CLEANUP_ERROR', 'Error removing tab', e);
-            }
-            currentTab = null;
-        }
         isProcessing = false;
     }
 }
 
+async function waitForTabLoad(tabId) {
+    tabLogger.debug(`Waiting for tab ${tabId} to complete loading`);
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            tabLogger.warn(`Tab ${tabId} load timeout`);
+            reject(new Error('Tab load timeout'));
+        }, 30000);
+
+        chrome.tabs.onUpdated.addListener(function listener(id, info) {
+            if (id === tabId && info.status === 'complete') {
+                tabLogger.debug(`Tab ${tabId} loaded successfully`);
+                clearTimeout(timeout);
+                chrome.tabs.onUpdated.removeListener(listener);
+                resolve();
+            }
+        });
+    });
+}
+
+async function extractContent(tabId) {
+    tabLogger.debug(`Extracting content from tab ${tabId}`);
+    return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(tabId, { type: "extract_content" }, response => {
+            if (chrome.runtime.lastError) {
+                tabLogger.error(`Content extraction failed for tab ${tabId}`, chrome.runtime.lastError);
+                reject(chrome.runtime.lastError);
+                return;
+            }
+            tabLogger.debug(`Content extracted successfully from tab ${tabId}`);
+            resolve(response.content);
+        });
+    });
+}
+
 async function pollServer(controlUrl) {
+    const pollId = Date.now();
+    pollLogger.debug(`Starting poll ${pollId}`, { url: controlUrl });
+    lastPollTime = Date.now();
+    
     try {
-        log('POLL', 'Starting poll');
-        const response = await fetchWithTimeout(`${controlUrl}/get_url`);
+        pollLogger.debug(`Poll ${pollId}: Fetching from server`);
+        const response = await fetchWithTimeout(`${controlUrl}/get_url`, {}, 30000);
+        
+        pollLogger.debug(`Poll ${pollId}: Response received`, { 
+            status: response.status,
+            ok: response.ok 
+        });
         
         if (response.status === 204) {
-            log('POLL', 'No URLs in queue');
+            pollLogger.info(`Poll ${pollId}: No URLs in queue`);
             return;
         }
 
@@ -169,124 +151,118 @@ async function pollServer(controlUrl) {
         }
 
         const data = await response.json();
-        log('POLL', 'Received URL from server');
+        pollLogger.info(`Poll ${pollId}: Received URL`, { url: data.url });
 
         if (data.url) {
-            setStatus('Processing URL: ' + data.url);
+            setStatus(`Processing URL: ${data.url}`);
             await processUrl(data.url);
         }
     } catch (error) {
-        log('POLL_ERROR', 'Polling failed', error);
-        setStatus('Polling error', error.message);
+        pollLogger.error(`Poll ${pollId} failed`, {
+            error: error.message,
+            stack: error.stack
+        });
+        throw error;
     }
 }
 
-// Initialize settings from URL if present
-chrome.runtime.onInstalled.addListener(async () => {
-    log('INSTALL', 'Extension installed/updated');
-    await urlSettingsManager.checkConfigTabs();
-});
+async function initializeExtension() {
+    initLogger.info('Extension initialization started');
+    
+    try {
+        const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
+        initLogger.debug('Loaded stored settings', settings);
 
-chrome.runtime.onStartup.addListener(async () => {
-    log('STARTUP', 'Extension starting up');
-    await urlSettingsManager.checkConfigTabs();
-});
+        initLogger.debug('Initializing UrlSettingsManager');
+        urlSettingsManager.onSettingsUpdated = async (newSettings) => {
+            settingsLogger.info('Settings updated from URL', newSettings);
+            await startPollingWithSettings(newSettings);
+        };
+        
+        initLogger.debug('Checking for existing config tabs');
+        await urlSettingsManager.checkConfigTabs();
 
-// Initialize tab listeners for URL-based configuration
-urlSettingsManager.initializeTabListeners(defaultSettings);
+        if (settings.controlUrl && settings.pollInterval) {
+            initLogger.info('Starting polling with stored settings', settings);
+            await startPollingWithSettings(settings);
+        } else {
+            initLogger.info('Waiting for configuration - no stored settings');
+        }
+        
+        initLogger.info('Extension initialization completed');
+    } catch (error) {
+        initLogger.error('Extension initialization failed', error);
+    }
+}
 
 async function startPollingWithSettings(settings) {
-    if (!settings.controlUrl || !settings.pollInterval) return;
+    settingsLogger.info('Starting polling with settings', settings);
+    
+    if (!settings.controlUrl || !settings.pollInterval) {
+        settingsLogger.warn('Invalid polling settings provided', settings);
+        return;
+    }
     
     if (pollingInterval) {
+        pollLogger.debug('Clearing existing polling interval');
         clearInterval(pollingInterval);
     }
     
     setStatus('Starting polling');
+    lastPollTime = Date.now();
     
-    // Initial poll
-    await pollServer(settings.controlUrl).catch(error => {
-        log('POLLING_ERROR', 'Initial poll failed', error);
-    });
+    try {
+        pollLogger.debug('Executing initial poll');
+        await pollServer(settings.controlUrl);
+    } catch (error) {
+        pollLogger.error('Initial poll failed', error);
+    }
 
-    // Set up recurring polls
+    pollLogger.info(`Setting up recurring polls every ${settings.pollInterval} seconds`);
     pollingInterval = setInterval(() => {
         if (!isProcessing) {
             pollServer(settings.controlUrl).catch(error => {
-                log('POLLING_ERROR', 'Interval poll failed', error);
+                pollLogger.error('Interval poll failed', error);
             });
+        } else {
+            pollLogger.debug('Skipping poll - processing in progress');
         }
     }, settings.pollInterval * 1000);
 }
 
-// Modify the URL settings manager initialization
-urlSettingsManager.onSettingsUpdated = async (settings) => {
-    await startPollingWithSettings(settings);
-};
-
-// Handle messages from popup
+// Message handling
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    log('MESSAGE', `Received message: ${request.type}`);
+    messageLogger.debug('Message received', { type: request.type, sender: sender.id });
     
     switch (request.type) {
-        case "start_polling":
-            if (pollingInterval) {
-                clearInterval(pollingInterval);
-                log('POLLING', 'Cleared existing interval');
-            }
-            
-            setStatus('Starting polling');
-            
-            // Update settings from request
-            urlSettingsManager.setStorageSync({
-                controlUrl: request.controlUrl,
-                pollInterval: request.pollInterval
-            }).then(() => {
-                // Initial poll
-                pollServer(request.controlUrl).catch(error => {
-                    log('POLLING_ERROR', 'Initial poll failed', error);
-                });
-
-                // Set up recurring polls
-                pollingInterval = setInterval(() => {
-                    if (!isProcessing) {
-                        pollServer(request.controlUrl).catch(error => {
-                            log('POLLING_ERROR', 'Interval poll failed', error);
-                        });
-                    } else {
-                        log('POLLING', 'Skipping poll - processing in progress');
-                    }
-                }, request.pollInterval * 1000);
-            });
-            
-            sendResponse({ 
-                status: currentStatus,
-                error: currentError,
-                currentTab: currentTab?.url
+        case 'start_polling':
+            messageLogger.info('Start polling requested', request);
+            startPollingWithSettings(request).then(() => {
+                sendResponse({ status: currentStatus });
             });
             break;
-
-        case "stop_polling":
+            
+        case 'stop_polling':
+            messageLogger.info('Stop polling requested');
             if (pollingInterval) {
                 clearInterval(pollingInterval);
                 pollingInterval = null;
                 setStatus('Polling stopped');
-                log('POLLING', 'Polling stopped');
             }
-            sendResponse({ 
-                status: currentStatus,
-                error: currentError,
-                currentTab: currentTab?.url
-            });
+            sendResponse({ status: currentStatus });
             break;
-
-        case "get_status":
-            sendResponse({ 
-                status: currentStatus,
-                error: currentError,
-                currentTab: currentTab?.url
-            });
+            
+        case 'get_status':
+            messageLogger.debug('Status requested', { currentStatus });
+            sendResponse({ status: currentStatus });
             break;
     }
+    
     return true;
+});
+
+// Initialize the extension
+logger.info('Background script loaded');
+initializeExtension().catch(error => {
+    logger.error('Fatal initialization error', error);
 });
