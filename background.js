@@ -195,6 +195,35 @@ chrome.runtime.onStartup.addListener(async () => {
 // Initialize tab listeners for URL-based configuration
 urlSettingsManager.initializeTabListeners(defaultSettings);
 
+async function startPollingWithSettings(settings) {
+    if (!settings.controlUrl || !settings.pollInterval) return;
+    
+    if (pollingInterval) {
+        clearInterval(pollingInterval);
+    }
+    
+    setStatus('Starting polling');
+    
+    // Initial poll
+    await pollServer(settings.controlUrl).catch(error => {
+        log('POLLING_ERROR', 'Initial poll failed', error);
+    });
+
+    // Set up recurring polls
+    pollingInterval = setInterval(() => {
+        if (!isProcessing) {
+            pollServer(settings.controlUrl).catch(error => {
+                log('POLLING_ERROR', 'Interval poll failed', error);
+            });
+        }
+    }, settings.pollInterval * 1000);
+}
+
+// Modify the URL settings manager initialization
+urlSettingsManager.onSettingsUpdated = async (settings) => {
+    await startPollingWithSettings(settings);
+};
+
 // Handle messages from popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     log('MESSAGE', `Received message: ${request.type}`);

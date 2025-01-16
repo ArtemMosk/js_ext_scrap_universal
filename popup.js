@@ -1,7 +1,7 @@
 // popup.js
 document.addEventListener('DOMContentLoaded', async () => {
-    // Load saved settings
-    const settings = await chrome.storage.local.get(['controlUrl', 'pollInterval']);
+    // Load saved settings from sync storage
+    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
     if (settings.controlUrl) {
         document.getElementById('control-url').value = settings.controlUrl;
     }
@@ -24,8 +24,7 @@ document.getElementById('start-polling').addEventListener('click', async () => {
         return;
     }
 
-    // Save settings
-    await chrome.storage.local.set({ controlUrl, pollInterval });
+    await chrome.storage.sync.set({ controlUrl, pollInterval });
 
     // Start polling
     chrome.runtime.sendMessage({ 
@@ -44,7 +43,7 @@ document.getElementById('stop-polling').addEventListener('click', () => {
 });
 
 document.getElementById('clear-settings').addEventListener('click', async () => {
-    await chrome.storage.local.clear();
+    await chrome.storage.sync.clear();
     document.getElementById('control-url').value = '';
     document.getElementById('poll-interval').value = '30';
     document.getElementById('status').textContent = 'Status: Settings cleared';

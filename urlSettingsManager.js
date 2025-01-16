@@ -5,6 +5,7 @@ export default class UrlSettingsManager {
         this.logger = logger;
         // Keys that should always be treated as arrays even if they have a single value
         this.arrayKeys = ['entity_ids'];
+        this.onSettingsUpdated = null; // Add callback property
     }
 
     /**
@@ -57,6 +58,11 @@ export default class UrlSettingsManager {
         // Save the updated settings
         await this.setStorageSync(updatedSettings);
         this.logger.info("Updated settings with values loaded from ext-config.com URL");
+
+        // Call the callback if it exists
+        if (this.onSettingsUpdated) {
+            await this.onSettingsUpdated(updatedSettings);
+        }
 
         return updatedSettings;
     }
