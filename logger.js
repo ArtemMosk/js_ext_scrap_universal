@@ -15,33 +15,54 @@ export default class Logger {
         return [`[${timestamp}]${prefix} ${message}`, data].filter(Boolean);
     }
 
+    async _saveLog(level, message, data) {
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            level,
+            prefix: this.prefix,
+            message,
+            data
+        };
+
+        // Get existing logs
+        const { debugLogs = [] } = await chrome.storage.local.get('debugLogs');
+        
+        // Add new log and keep last 1000 entries
+        debugLogs.push(logEntry);
+        if (debugLogs.length > 1000) {
+            debugLogs.shift();
+        }
+
+        // Save back to storage
+        await chrome.storage.local.set({ debugLogs });
+    }
+
     debug(message, data = null) {
         this._debug(...this.formatMessage(message, data));
+        this._saveLog('DEBUG', message, data);
     }
 
     info(message, data = null) {
         this._info(...this.formatMessage(message, data));
+        this._saveLog('INFO', message, data);
     }
 
     warn(message, data = null) {
         this._warn(...this.formatMessage(message, data));
+        this._saveLog('WARN', message, data);
     }
 
     error(message, data = null) {
         this._error(...this.formatMessage(message, data));
+        this._saveLog('ERROR', message, data);
     }
 
-    static getLogs() {
-        return new Promise((resolve) => {
-            chrome.storage.local.get(['debugLogs'], result => {
-                resolve(result.debugLogs || []);
-            });
-        });
+    static async getLogs() {
+        const { debugLogs = [] } = await chrome.storage.local.get('debugLogs');
+        return debugLogs;
     }
 
-    static clearLogs() {
-        return new Promise((resolve) => {
-            chrome.storage.local.remove(['debugLogs'], resolve);
-        });
+    static async clearLogs() {
+        await chrome.storage.local.remove('debugLogs');
     }
 } 

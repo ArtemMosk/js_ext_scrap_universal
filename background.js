@@ -256,6 +256,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             messageLogger.debug('Status requested', { currentStatus });
             sendResponse({ status: currentStatus });
             break;
+            
+        case 'get_logs':
+            messageLogger.debug('Logs requested');
+            Logger.getLogs().then(logs => {
+                sendResponse(logs);
+            });
+            break;
     }
     
     return true;

@@ -48,3 +48,13 @@ document.getElementById('clear-settings').addEventListener('click', async () => 
     document.getElementById('poll-interval').value = '30';
     document.getElementById('status').textContent = 'Status: Settings cleared';
 });
+
+document.getElementById('view-logs').addEventListener('click', async () => {
+    // Get logs from storage
+    const logs = await chrome.runtime.sendMessage({ type: "get_logs" });
+    
+    // Open logs in a new tab
+    const blob = new Blob([JSON.stringify(logs, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    chrome.tabs.create({ url });
+});
