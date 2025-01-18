@@ -8,7 +8,8 @@
     "downloads",
     "activeTab",
     "webNavigation",
-    "webRequest"
+    "webRequest",
+    "tabs"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -23,8 +24,10 @@
       "128": "icon.webp"
     }
   },
-  "content_scripts": [{
-    "matches": ["<all_urls>"],
-    "js": ["content.js"]
-  }]
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["contentExtractor.js", "screenshotCapture.js"]
+    }
+  ]
 }

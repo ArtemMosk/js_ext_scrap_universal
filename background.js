@@ -1,6 +1,8 @@
 // background.js
 import UrlSettingsManager from './urlSettingsManager.js';
 import Logger from './logger.js';
+import NetworkRequestTracker from './networkRequestTracker.js';
+import ScreenshotCapture from './backgroundScreenshotHandler.js';
 
 // Loggers for different components
 const logger = new Logger();
@@ -11,6 +13,7 @@ const processLogger = new Logger('PROCESS');
 const statusLogger = new Logger('STATUS');
 const messageLogger = new Logger('MESSAGE');
 const tabLogger = new Logger('TAB');
+const fetchLogger = new Logger('FETCH');
 
 let pollingInterval = null;
 let isProcessing = false;
@@ -26,87 +29,159 @@ const defaultSettings = {
     pollInterval: 30
 };
 
-// Simple logging function without status updates
-function log(type, message, data = null) {
-    const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] ${type}: ${message}`;
-    console.log(logMessage);
-    if (data) {
-        console.log('Additional data:', data);
-    }
-}
-
 // Direct status setter without logging
-function setStatus(status, error = null) {
+function setStatus(status) {
+    statusLogger.info('Status changing', { from: currentStatus, to: status });
     currentStatus = status;
-    currentError = error;
 }
 
-async function fetchWithTimeout(url, options = {}, timeout = 30000) {
+async function fetchWithTimeout(url, options = {}, timeout = 5000) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    const id = Date.now();
     
-    log('FETCH', `Fetching ${url} with timeout ${timeout}ms`);
+    const timeoutId = setTimeout(() => {
+        fetchLogger.debug(`Request ${id} timed out after ${timeout}ms`, { url });
+        controller.abort();
+    }, timeout);
+
     try {
+        fetchLogger.debug(`Starting request ${id}`, { url, timeout });
         const response = await fetch(url, {
             ...options,
             signal: controller.signal
         });
-        clearTimeout(timeoutId);
-        log('FETCH', `Received response from ${url}, status: ${response.status}`);
+        fetchLogger.debug(`Request ${id} completed`, { 
+            status: response.status,
+            ok: response.ok 
+        });
         return response;
     } catch (error) {
-        clearTimeout(timeoutId);
-        log('FETCH_ERROR', `Error fetching ${url}`, error);
+        if (error.name === 'AbortError') {
+            fetchLogger.debug(`Request ${id} aborted`, { url });
+        } else {
+            fetchLogger.error(`Request ${id} failed`, { 
+                url, 
+                error: error.message 
+            });
+        }
         throw error;
+    } finally {
+        clearTimeout(timeoutId);
     }
 }
 
-async function processUrl(url) {
+async function processUrl(url, controlUrl) {
     const processId = Date.now();
     processLogger.info(`Starting URL processing ${processId}`, { url });
     
     isProcessing = true;
+    let tab = null;
     try {
         processLogger.debug(`Process ${processId}: Creating tab`);
-        const tab = await chrome.tabs.create({ url, active: false });
+        tab = await chrome.tabs.create({ url, active: true });
         
-        processLogger.debug(`Process ${processId}: Waiting for tab load`);
+        // Set target URL before waiting for network idle
+        networkTracker.setTargetUrl(tab.id, url);
+        
+        processLogger.debug(`Process ${processId}: Waiting for tab load and security checks`);
         await waitForTabLoad(tab.id);
         
         processLogger.debug(`Process ${processId}: Extracting content`);
-        const content = await extractContent(tab.id);
+        const extractedContent = await extractContent(tab.id);
         
-        processLogger.info(`Process ${processId}: Content extracted`, {
-            titleLength: content.title?.length,
-            contentLength: content.readableContent?.length
+        // Wait additional time for any dynamic content
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        processLogger.debug(`Process ${processId}: Capturing full page screenshot`);
+        const screenshotCapture = new ScreenshotCapture();
+        const screenshot = await screenshotCapture.captureFullPage(tab.id);
+        
+        // Format the content according to server's expected schema
+        const formattedContent = {
+            url: url,
+            transformedUrl: extractedContent.url,
+            content: {
+                rawHtml: extractedContent.rawHtml,
+                readableContent: extractedContent.readableContent,
+                title: extractedContent.title,
+                screenshot: screenshot
+            }
+        };
+
+        // Log preview of content
+        processLogger.info(`Process ${processId}: Content preview`, {
+            originalUrl: formattedContent.url,
+            transformedUrl: formattedContent.transformedUrl,
+            titleLength: formattedContent.content.title?.length,
+            contentLength: formattedContent.content.readableContent?.length,
+            screenshotSize: formattedContent.content.screenshot?.length,
+            contentPreview: formattedContent.content.readableContent?.substring(0, 100)
         });
-        
-        processLogger.debug(`Process ${processId}: Closing tab`);
-        await chrome.tabs.remove(tab.id);
+
+        // Send to server with detailed logging
+        try {
+            processLogger.debug(`Process ${processId}: Sending to server`, {
+                endpoint: controlUrl,
+                contentSize: JSON.stringify(formattedContent).length
+            });
+
+            const response = await fetch(controlUrl + '/submit', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(formattedContent)
+            });
+
+            const responseData = await response.text();
+            processLogger.info(`Process ${processId}: Server response`, {
+                status: response.status,
+                responsePreview: responseData.substring(0, 100)
+            });
+
+            if (!response.ok) {
+                throw new Error(`Server responded with ${response.status}: ${responseData}`);
+            }
+        } catch (serverError) {
+            processLogger.error(`Process ${processId}: Server communication failed`, serverError);
+            throw serverError;
+        }
         
         processLogger.info(`Process ${processId}: Processing completed successfully`);
+        return formattedContent;
     } catch (error) {
         processLogger.error(`Process ${processId} failed`, error);
+        throw error;
     } finally {
+        if (tab) {
+            processLogger.debug(`Process ${processId}: Closing tab`);
+            await chrome.tabs.remove(tab.id).catch(e => 
+                processLogger.error(`Failed to close tab`, e)
+            );
+        }
         isProcessing = false;
     }
 }
 
-async function waitForTabLoad(tabId) {
-    tabLogger.debug(`Waiting for tab ${tabId} to complete loading`);
-    return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-            tabLogger.warn(`Tab ${tabId} load timeout`);
-            reject(new Error('Tab load timeout'));
-        }, 30000);
+const networkTracker = new NetworkRequestTracker();
+const screenshotCapture = new ScreenshotCapture();
 
+async function waitForTabLoad(tabId) {
+    return new Promise((resolve, reject) => {
         chrome.tabs.onUpdated.addListener(function listener(id, info) {
             if (id === tabId && info.status === 'complete') {
-                tabLogger.debug(`Tab ${tabId} loaded successfully`);
-                clearTimeout(timeout);
                 chrome.tabs.onUpdated.removeListener(listener);
-                resolve();
+                
+                // Increased timeout and added ignoreScreenshotCapture option
+                networkTracker.waitForNetworkIdle(tabId, {
+                    timeout: 45000,        // Increase to 45 seconds
+                    quietPeriod: 2000,     // Reduce to 2 seconds
+                    checkInterval: 100,
+                    ignoreScreenshotCapture: true,
+                    maxActiveRequests: 2   // New: allow up to 2 active requests
+                })
+                .then(resolve)
+                .catch(reject);
             }
         });
     });
@@ -142,7 +217,7 @@ async function pollServer(controlUrl) {
         });
         
         if (response.status === 204) {
-            pollLogger.info(`Poll ${pollId}: No URLs in queue`);
+            pollLogger.debug(`Poll ${pollId}: No URLs in queue`);
             return;
         }
 
@@ -155,13 +230,17 @@ async function pollServer(controlUrl) {
 
         if (data.url) {
             setStatus(`Processing URL: ${data.url}`);
-            await processUrl(data.url);
+            await processUrl(data.url, controlUrl);
         }
     } catch (error) {
-        pollLogger.error(`Poll ${pollId} failed`, {
-            error: error.message,
-            stack: error.stack
-        });
+        if (error.name === 'AbortError') {
+            pollLogger.debug(`Poll ${pollId}: Request timeout - normal during idle periods`);
+        } else {
+            pollLogger.error(`Poll ${pollId} failed`, {
+                error: error.message,
+                stack: error.stack
+            });
+        }
         throw error;
     }
 }
