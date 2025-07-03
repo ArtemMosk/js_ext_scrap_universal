@@ -76,6 +76,8 @@ async function processUrl(url, controlUrl) {
     
     isProcessing = true;
     let tab = null;
+    let formattedContent = null;
+    
     try {
         processLogger.debug(`Process ${processId}: Creating tab`);
         tab = await chrome.tabs.create({ url, active: true });
@@ -97,11 +99,12 @@ async function processUrl(url, controlUrl) {
         const screenshot = await screenshotCapture.captureFullPage(tab.id);
         
         // Format the content according to server's expected schema
-        const formattedContent = {
+        formattedContent = {
             url: url,
             transformedUrl: extractedContent.url,
             content: {
                 rawHtml: extractedContent.rawHtml,
+                rawPurifiedContent: extractedContent.rawPurifiedContent,
                 readableContent: extractedContent.readableContent,
                 title: extractedContent.title,
                 screenshot: screenshot
@@ -148,7 +151,6 @@ async function processUrl(url, controlUrl) {
         }
         
         processLogger.info(`Process ${processId}: Processing completed successfully`);
-        return formattedContent;
     } catch (error) {
         processLogger.error(`Process ${processId} failed`, error);
         throw error;
@@ -161,6 +163,8 @@ async function processUrl(url, controlUrl) {
         }
         isProcessing = false;
     }
+    
+    return formattedContent;
 }
 
 const networkTracker = new NetworkRequestTracker();
