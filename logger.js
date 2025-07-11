@@ -1,6 +1,7 @@
 export default class Logger {
     constructor(prefix = '') {
         this.prefix = prefix;
+        this.defaultGraylogEndpoint = 'https://gelf.pt.artemm.info/gelf';
     }
 
     _log(level, message, data = null) {
@@ -14,6 +15,7 @@ export default class Logger {
 
         console[level](`${timestamp}${prefix} ${message} ${location ? `(${location})` : ''}`, data || '');
         this._saveLog(level, message, data, location);
+        this._sendToGraylog(level, message, data, location);
     }
 
     debug(message, data = null) {
@@ -55,5 +57,50 @@ export default class Logger {
 
     static async clearLogs() {
         await chrome.storage.local.remove('debugLogs');
+    }
+
+    async _sendToGraylog(level, message, data, location) {
+        try {
+            // Get Graylog endpoint from settings
+            const { graylogEndpoint = this.defaultGraylogEndpoint } = await chrome.storage.sync.get('graylogEndpoint');
+            
+            if (!graylogEndpoint) {
+                return; // No endpoint configured, skip logging
+            }
+
+            const gelfMessage = {
+                version: '1.1',
+                host: 'browser_extension',
+                short_message: message,
+                full_message: data ? JSON.stringify(data) : message,
+                timestamp: Date.now() / 1000,
+                level: this._getGelfLevel(level),
+                facility: 'js_ext_scrap_universal',
+                _prefix: this.prefix,
+                _location: location,
+                _data: data ? JSON.stringify(data) : null
+            };
+
+            await fetch(graylogEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(gelfMessage)
+            });
+        } catch (error) {
+            // Silently fail to avoid logging loops
+            console.warn('Failed to send log to Graylog:', error.message);
+        }
+    }
+
+    _getGelfLevel(level) {
+        switch (level) {
+            case 'debug': return 7;
+            case 'info': return 6;
+            case 'warn': return 4;
+            case 'error': return 3;
+            default: return 6;
+        }
     }
 } 

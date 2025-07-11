@@ -60,7 +60,11 @@ export default class UrlSettingsManager {
                                        urlObj.searchParams.get('poll_interval')) || 
                                defaultSettings.pollInterval;
 
-            const newSettings = { controlUrl, pollInterval };
+            const graylogEndpoint = urlObj.searchParams.get('graylogEndpoint') || 
+                                  urlObj.searchParams.get('graylog_endpoint') || 
+                                  defaultSettings.graylogEndpoint;
+
+            const newSettings = { controlUrl, pollInterval, graylogEndpoint };
 
             this.logger.debug('Parsed settings from URL', { newSettings });
 

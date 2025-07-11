@@ -26,7 +26,8 @@ const urlSettingsManager = new UrlSettingsManager(console);
 // Define default settings matching your existing ones
 const defaultSettings = {
     controlUrl: '',
-    pollInterval: 30
+    pollInterval: 30,
+    graylogEndpoint: 'https://gelf.pt.artemm.info/gelf'
 };
 
 // Direct status setter without logging
