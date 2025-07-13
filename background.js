@@ -15,7 +15,9 @@ const messageLogger = new Logger('MESSAGE');
 const tabLogger = new Logger('TAB');
 const fetchLogger = new Logger('FETCH');
 
-let pollingInterval = null;
+// Alarm-based polling (replaces setInterval)
+const ALARM_NAME = 'pollServer';
+let pollingInterval = null; // Keep for compatibility, but will be null with alarms
 let isProcessing = false;
 let currentStatus = 'Idle';
 let lastPollTime = null;
@@ -76,6 +78,7 @@ async function processUrl(url, controlUrl) {
     processLogger.info(`Starting URL processing ${processId}`, { url });
     
     isProcessing = true;
+    await saveState();
     let tab = null;
     let formattedContent = null;
     
@@ -163,6 +166,7 @@ async function processUrl(url, controlUrl) {
             );
         }
         isProcessing = false;
+        await saveState();
     }
     
     return formattedContent;
@@ -254,6 +258,9 @@ async function initializeExtension() {
     initLogger.info('Extension initialization started');
     
     try {
+        // Restore previous state
+        await restoreState();
+        
         const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
         initLogger.debug('Loaded stored settings', settings);
 
@@ -287,13 +294,14 @@ async function startPollingWithSettings(settings) {
         return;
     }
     
-    if (pollingInterval) {
-        pollLogger.debug('Clearing existing polling interval');
-        clearInterval(pollingInterval);
-    }
+    // Clear any existing alarms
+    await chrome.alarms.clear(ALARM_NAME);
     
     setStatus('Starting polling');
     lastPollTime = Date.now();
+    
+    // Save state for persistence
+    await saveState();
     
     try {
         pollLogger.debug('Executing initial poll');
@@ -302,17 +310,54 @@ async function startPollingWithSettings(settings) {
         pollLogger.error('Initial poll failed', error);
     }
 
-    pollLogger.info(`Setting up recurring polls every ${settings.pollInterval} seconds`);
-    pollingInterval = setInterval(() => {
-        if (!isProcessing) {
+    // Create repeating alarm (minimum 0.5 minutes = 30 seconds)
+    const periodInMinutes = Math.max(0.5, settings.pollInterval / 60);
+    chrome.alarms.create(ALARM_NAME, {
+        periodInMinutes: periodInMinutes
+    });
+    
+    pollLogger.info(`Set up alarm polling every ${periodInMinutes} minutes (${settings.pollInterval} seconds)`);
+}
+
+// State persistence functions
+async function saveState() {
+    await chrome.storage.local.set({
+        lastPollTime: lastPollTime,
+        isProcessing: isProcessing,
+        currentStatus: currentStatus
+    });
+}
+
+async function restoreState() {
+    const state = await chrome.storage.local.get(['lastPollTime', 'isProcessing', 'currentStatus']);
+    if (state.lastPollTime) {
+        const timeSinceLastPoll = Date.now() - state.lastPollTime;
+        if (timeSinceLastPoll > 120000) { // 2 minutes
+            initLogger.warn(`Detected suspension - ${timeSinceLastPoll}ms since last poll`);
+        }
+        lastPollTime = state.lastPollTime;
+    }
+    if (state.isProcessing !== undefined) isProcessing = state.isProcessing;
+    if (state.currentStatus) currentStatus = state.currentStatus;
+    return state;
+}
+
+// Alarm listener for persistent polling
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === ALARM_NAME) {
+        const settings = await chrome.storage.sync.get(['controlUrl']);
+        if (settings.controlUrl && !isProcessing) {
+            pollLogger.debug('Alarm triggered poll');
+            lastPollTime = Date.now();
+            await saveState();
             pollServer(settings.controlUrl).catch(error => {
-                pollLogger.error('Interval poll failed', error);
+                pollLogger.error('Alarm poll failed', error);
             });
         } else {
-            pollLogger.debug('Skipping poll - processing in progress');
+            pollLogger.debug('Skipping alarm poll - processing in progress or no controlUrl');
         }
-    }, settings.pollInterval * 1000);
-}
+    }
+});
 
 // Message handling
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -328,11 +373,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             
         case 'stop_polling':
             messageLogger.info('Stop polling requested');
-            if (pollingInterval) {
-                clearInterval(pollingInterval);
-                pollingInterval = null;
-                setStatus('Polling stopped');
-            }
+            await chrome.alarms.clear(ALARM_NAME);
+            setStatus('Polling stopped');
+            await saveState();
             sendResponse({ status: currentStatus });
             break;
             

@@ -3,6 +3,7 @@
   "name": "Universal Web Scraper",
   "version": "1.0",
   "permissions": [
+    "alarms",
     "scripting",
     "storage",
     "downloads",
