@@ -2,6 +2,58 @@ export default class Logger {
     constructor(prefix = '') {
         this.prefix = prefix;
         this.defaultGraylogEndpoint = 'https://gelf.pt.artemm.info/gelf';
+        // Generate instance ID synchronously
+        this.instanceId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+        this.containerName = null;
+        this._containerParsed = false;
+        this._instanceIdPersisted = false;
+    }
+    
+    async _loadOrPersistInstanceId() {
+        if (this._instanceIdPersisted) return;
+        
+        try {
+            const stored = await chrome.storage.local.get('instanceId');
+            if (stored.instanceId) {
+                // Use stored ID if available
+                this.instanceId = stored.instanceId;
+            } else {
+                // Persist the generated ID
+                await chrome.storage.local.set({ instanceId: this.instanceId });
+            }
+            this._instanceIdPersisted = true;
+        } catch (error) {
+            // Keep using the generated ID if storage fails
+            console.warn('Failed to persist instance ID:', error);
+        }
+    }
+    
+    async _parseContainerFromUrl() {
+        try {
+            // First check if container was stored from config URL
+            const stored = await chrome.storage.local.get('containerName');
+            if (stored.containerName) {
+                this.containerName = stored.containerName;
+                return;
+            }
+            
+            // Try to get from current tab URL if it's a config URL
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tabs && tabs[0] && tabs[0].url) {
+                const url = new URL(tabs[0].url);
+                if (url.hostname === 'ext-config.com') {
+                    const container = url.searchParams.get('container');
+                    if (container) {
+                        this.containerName = container;
+                        // Store it for future use
+                        await chrome.storage.local.set({ containerName: container });
+                    }
+                }
+            }
+        } catch (error) {
+            // Container name is optional, so we can fail silently
+            this.containerName = null;
+        }
     }
 
     _log(level, message, data = null) {
@@ -142,23 +194,38 @@ export default class Logger {
 
     async _sendToGraylog(level, message, data, location) {
         try {
-            // Determine which endpoint to use based on facility
-            let graylogEndpoint;
-            let facility;
+            // Get manifest for extension info
+            const manifest = chrome.runtime.getManifest();
             
+            // Auto-detect facility from manifest name
+            let facility;
             if (this.prefix && this.prefix.startsWith('TEST-')) {
-                // Test extension - use default endpoint and test facility
-                graylogEndpoint = this.defaultGraylogEndpoint;
                 facility = 'test-race-chrome';
             } else {
-                // Production extension - check storage for custom endpoint
+                // Convert extension name to facility format
+                facility = manifest.name.toLowerCase().replace(/\s+/g, '_');
+            }
+            
+            // Get endpoint
+            let graylogEndpoint;
+            if (this.prefix && this.prefix.startsWith('TEST-')) {
+                graylogEndpoint = this.defaultGraylogEndpoint;
+            } else {
                 const settings = await chrome.storage.sync.get('graylogEndpoint');
                 graylogEndpoint = settings.graylogEndpoint || this.defaultGraylogEndpoint;
-                facility = 'js_ext_scrap_universal';
             }
             
             if (!graylogEndpoint) {
                 return; // No endpoint configured, skip logging
+            }
+            
+            // Load persisted instance ID if not done yet
+            await this._loadOrPersistInstanceId();
+            
+            // Parse container name if not done yet
+            if (!this._containerParsed) {
+                await this._parseContainerFromUrl();
+                this._containerParsed = true;
             }
 
             const gelfMessage = {
@@ -171,7 +238,11 @@ export default class Logger {
                 facility: facility,
                 _prefix: this.prefix,
                 _location: location,
-                _data: data ? JSON.stringify(data) : null
+                _data: data ? JSON.stringify(data) : null,
+                _instance_id: this.instanceId,
+                _container: this.containerName || 'unknown',
+                _extension_version: manifest.version,
+                _extension_name: manifest.name
             };
 
             await fetch(graylogEndpoint, {
