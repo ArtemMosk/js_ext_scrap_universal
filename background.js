@@ -3,6 +3,7 @@ import UrlSettingsManager from './urlSettingsManager.js';
 import Logger from './logger.js';
 import NetworkRequestTracker from './networkRequestTracker.js';
 import ScreenshotCapture from './backgroundScreenshotHandler.js';
+import { StateLock } from './stateLock.js';
 
 // Loggers for different components
 const logger = new Logger();
@@ -14,6 +15,10 @@ const statusLogger = new Logger('STATUS');
 const messageLogger = new Logger('MESSAGE');
 const tabLogger = new Logger('TAB');
 const fetchLogger = new Logger('FETCH');
+const lockLogger = new Logger('LOCK');
+
+// Initialize StateLock
+const stateLock = new StateLock(lockLogger);
 
 // Alarm-based polling (replaces setInterval)
 const ALARM_NAME = 'pollServer';
@@ -21,6 +26,9 @@ let pollingInterval = null; // Keep for compatibility, but will be null with ala
 let isProcessing = false;
 let currentStatus = 'Idle';
 let lastPollTime = null;
+
+// Continuous polling state
+let isContinuousPolling = false;
 
 // Initialize URL Settings Manager
 const urlSettingsManager = new UrlSettingsManager(console);
@@ -77,7 +85,13 @@ async function processUrl(url, controlUrl) {
     const processId = Date.now();
     processLogger.info(`Starting URL processing ${processId}`, { url });
     
-    isProcessing = true;
+    // Set processing state in StateLock
+    await stateLock.setState('processing', {
+        url: url,
+        processId: processId,
+        startTime: Date.now()
+    });
+    isProcessing = true; // Keep for backward compatibility
     await saveState();
     let tab = null;
     let formattedContent = null;
@@ -165,7 +179,9 @@ async function processUrl(url, controlUrl) {
                 processLogger.error(`Failed to close tab`, e)
             );
         }
-        isProcessing = false;
+        // Clear processing state in StateLock
+        await stateLock.clearState('processing');
+        isProcessing = false; // Keep for backward compatibility
         await saveState();
     }
     
@@ -213,7 +229,18 @@ async function extractContent(tabId) {
 
 async function pollServer(controlUrl) {
     const pollId = Date.now();
-    pollLogger.debug(`Starting poll ${pollId}`, { url: controlUrl });
+    
+    // Try to acquire polling lock
+    const lockId = await stateLock.tryAcquireLock('polling', 3, 1000);
+    if (!lockId) {
+        pollLogger.warn('Could not acquire polling lock, skipping', { 
+            pollId,
+            message: 'Another poll is already in progress'
+        });
+        return false; // Indicate polling is already active
+    }
+    
+    pollLogger.debug(`Starting poll ${pollId}`, { url: controlUrl, lockId });
     lastPollTime = Date.now();
     
     try {
@@ -227,7 +254,7 @@ async function pollServer(controlUrl) {
         
         if (response.status === 204) {
             pollLogger.debug(`Poll ${pollId}: No URLs in queue`);
-            return;
+            return true; // Continue polling
         }
 
         if (!response.ok) {
@@ -240,18 +267,59 @@ async function pollServer(controlUrl) {
         if (data.url) {
             setStatus(`Processing URL: ${data.url}`);
             await processUrl(data.url, controlUrl);
+            return true; // Continue polling after processing
         }
+        
+        return true; // Continue polling
     } catch (error) {
         if (error.name === 'AbortError') {
             pollLogger.debug(`Poll ${pollId}: Request timeout - normal during idle periods`);
+            return true; // Continue polling after timeout
         } else {
             pollLogger.error(`Poll ${pollId} failed`, {
                 error: error.message,
                 stack: error.stack
             });
+            // For other errors, stop continuous polling (alarm will restart it)
+            return false;
         }
-        throw error;
+    } finally {
+        // Always release the lock
+        await stateLock.releaseLock('polling', lockId);
+        pollLogger.debug(`Poll ${pollId}: Released lock`, { lockId });
     }
+}
+
+async function startContinuousPolling(controlUrl) {
+    if (isContinuousPolling) {
+        pollLogger.debug('Continuous polling already active');
+        return;
+    }
+    
+    isContinuousPolling = true;
+    pollLogger.info('Starting continuous polling', { controlUrl });
+    
+    while (isContinuousPolling) {
+        const shouldContinue = await pollServer(controlUrl);
+        
+        if (!shouldContinue) {
+            pollLogger.warn('Continuous polling stopped due to error');
+            isContinuousPolling = false;
+            break;
+        }
+        
+        // Small delay between polls to prevent CPU spinning
+        if (isContinuousPolling) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+    }
+    
+    pollLogger.info('Continuous polling ended');
+}
+
+async function stopContinuousPolling() {
+    pollLogger.info('Stopping continuous polling');
+    isContinuousPolling = false;
 }
 
 async function initializeExtension() {
@@ -303,20 +371,16 @@ async function startPollingWithSettings(settings) {
     // Save state for persistence
     await saveState();
     
-    try {
-        pollLogger.debug('Executing initial poll');
-        await pollServer(settings.controlUrl);
-    } catch (error) {
-        pollLogger.error('Initial poll failed', error);
-    }
-
-    // Create repeating alarm (minimum 0.5 minutes = 30 seconds)
+    // Create repeating alarm as backup (minimum 0.5 minutes = 30 seconds)
     const periodInMinutes = Math.max(0.5, settings.pollInterval / 60);
     chrome.alarms.create(ALARM_NAME, {
         periodInMinutes: periodInMinutes
     });
     
-    pollLogger.info(`Set up alarm polling every ${periodInMinutes} minutes (${settings.pollInterval} seconds)`);
+    pollLogger.info(`Set up backup alarm every ${periodInMinutes} minutes (${settings.pollInterval} seconds)`);
+    
+    // Start continuous polling
+    startContinuousPolling(settings.controlUrl);
 }
 
 // State persistence functions
@@ -342,19 +406,39 @@ async function restoreState() {
     return state;
 }
 
-// Alarm listener for persistent polling
+// Alarm listener for persistent polling (backup mechanism)
 chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name === ALARM_NAME) {
         const settings = await chrome.storage.sync.get(['controlUrl']);
-        if (settings.controlUrl && !isProcessing) {
-            pollLogger.debug('Alarm triggered poll');
+        
+        if (settings.controlUrl && !isContinuousPolling) {
+            pollLogger.info('Alarm triggered - restarting continuous polling');
             lastPollTime = Date.now();
             await saveState();
-            pollServer(settings.controlUrl).catch(error => {
-                pollLogger.error('Alarm poll failed', error);
-            });
+            
+            // Check for stale processing state
+            const processingState = await stateLock.getState('processing');
+            if (processingState) {
+                const age = Date.now() - processingState.startTime;
+                if (age > 600000) { // 10 minutes - definitely stale
+                    pollLogger.warn('Clearing stale processing state', {
+                        url: processingState.url,
+                        age: age,
+                        processId: processingState.processId
+                    });
+                    await stateLock.clearState('processing');
+                    isProcessing = false;
+                    await saveState();
+                }
+            }
+            
+            // Restart continuous polling
+            startContinuousPolling(settings.controlUrl);
         } else {
-            pollLogger.debug('Skipping alarm poll - processing in progress or no controlUrl');
+            pollLogger.debug('Skipping alarm - continuous polling active', { 
+                hasControlUrl: !!settings.controlUrl,
+                isContinuousPolling: isContinuousPolling
+            });
         }
     }
 });
@@ -373,10 +457,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             
         case 'stop_polling':
             messageLogger.info('Stop polling requested');
-            await chrome.alarms.clear(ALARM_NAME);
-            setStatus('Polling stopped');
-            await saveState();
-            sendResponse({ status: currentStatus });
+            stopContinuousPolling();
+            chrome.alarms.clear(ALARM_NAME).then(() => {
+                setStatus('Polling stopped');
+                return saveState();
+            }).then(() => {
+                sendResponse({ status: currentStatus });
+            }).catch(error => {
+                messageLogger.error('Error stopping polling', error);
+                sendResponse({ status: 'Error: ' + error.message });
+            });
             break;
             
         case 'get_status':
@@ -393,6 +483,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     return true;
+});
+
+// Initialize alarms on install/update
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+    logger.info('Extension installed/updated', { reason, time: new Date().toISOString() });
+    
+    // Get current settings and start polling if configured
+    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
+    if (settings.controlUrl && settings.pollInterval) {
+        const interval = parseInt(settings.pollInterval);
+        const periodInMinutes = Math.max(0.5, interval / 60); // Convert seconds to minutes, minimum 30s
+        await chrome.alarms.create(ALARM_NAME, { periodInMinutes: periodInMinutes });
+        logger.info('Polling alarm created', { intervalSeconds: interval, periodInMinutes: periodInMinutes });
+        
+        // Start continuous polling immediately
+        startContinuousPolling(settings.controlUrl);
+    }
+});
+
+// Initialize alarms on browser startup
+chrome.runtime.onStartup.addListener(async () => {
+    logger.info('Browser started, extension loading', { time: new Date().toISOString() });
+    
+    // Restore alarms
+    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
+    if (settings.controlUrl && settings.pollInterval) {
+        const interval = parseInt(settings.pollInterval);
+        const periodInMinutes = Math.max(0.5, interval / 60); // Convert seconds to minutes, minimum 30s
+        await chrome.alarms.create(ALARM_NAME, { periodInMinutes: periodInMinutes });
+        logger.info('Polling alarm restored', { intervalSeconds: interval, periodInMinutes: periodInMinutes });
+        
+        // Start continuous polling immediately
+        startContinuousPolling(settings.controlUrl);
+    }
 });
 
 // Initialize the extension

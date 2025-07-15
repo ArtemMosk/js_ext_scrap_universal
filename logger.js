@@ -5,17 +5,85 @@ export default class Logger {
     }
 
     _log(level, message, data = null) {
-        const timestamp = new Date().toISOString();
-        const prefix = this.prefix ? ` [${this.prefix}]` : '';
+        let timestamp;
+        let prefix;
+        let location;
+        let fullMessage;
         
-        // Get the caller's stack trace
-        const stack = new Error().stack.split('\n')[3];
-        const fileInfo = stack.match(/at .+ \((.+)\)/) || stack.match(/at (.+)/);
-        const location = fileInfo ? fileInfo[1] : 'unknown';
-
-        console[level](`${timestamp}${prefix} ${message} ${location ? `(${location})` : ''}`, data || '');
-        this._saveLog(level, message, data, location);
-        this._sendToGraylog(level, message, data, location);
+        try {
+            timestamp = new Date().toISOString();
+            prefix = this.prefix ? ` [${this.prefix}]` : '';
+            
+            // Get the caller's stack trace
+            const stack = new Error().stack.split('\n')[3];
+            const fileInfo = stack.match(/at .+ \((.+)\)/) || stack.match(/at (.+)/);
+            location = fileInfo ? fileInfo[1] : 'unknown';
+            
+            // Build the full message string safely
+            fullMessage = timestamp + prefix + ' ' + message;
+            if (location && location !== 'unknown') {
+                fullMessage = fullMessage + ' (' + location + ')';
+            }
+            
+            // For warn/error levels, ensure message is in data for Graylog visibility
+            if ((level === 'warn' || level === 'error') && data && typeof data === 'object') {
+                // Add message to data object if not already present
+                if (!data.message) {
+                    data = { message, ...data };
+                }
+            } else if ((level === 'warn' || level === 'error') && !data) {
+                // Create data object with message for warn/error
+                data = { message };
+            }
+            
+            // Log to console safely
+            this._logToConsole(level, fullMessage, data);
+            
+        } catch (e) {
+            console.error('Logger error in _log:', e);
+            // Fallback logging
+            console.log(String(message), data || '');
+        }
+        
+        // Save and send logs (with error handling)
+        this._saveLog(level, message, data, location).catch(err => {
+            console.warn('Failed to save log:', err.message);
+        });
+        
+        this._sendToGraylog(level, message, data, location).catch(err => {
+            // Silently fail Graylog sends
+        });
+    }
+    
+    _logToConsole(level, fullMessage, data) {
+        try {
+            // Append data as JSON string if present
+            let consoleMessage = fullMessage;
+            if (data) {
+                consoleMessage = consoleMessage + ' Data: ' + JSON.stringify(data);
+            }
+            
+            // Use appropriate console method
+            switch(level) {
+                case 'error':
+                    console.error(consoleMessage);
+                    break;
+                case 'warn':
+                    console.warn(consoleMessage);
+                    break;
+                case 'debug':
+                    console.debug(consoleMessage);
+                    break;
+                case 'info':
+                default:
+                    console.log(consoleMessage);
+                    break;
+            }
+        } catch (e) {
+            console.error('Failed to log to console:', e);
+            // Last resort fallback
+            console.log(String(fullMessage));
+        }
     }
 
     debug(message, data = null) {
@@ -35,34 +103,59 @@ export default class Logger {
     }
 
     async _saveLog(level, message, data, location) {
-        const logEntry = {
-            timestamp: new Date().toISOString(),
-            level,
-            prefix: this.prefix,
-            message,
-            data,
-            location
-        };
+        try {
+            const logEntry = {
+                timestamp: new Date().toISOString(),
+                level,
+                prefix: this.prefix,
+                message,
+                data,
+                location
+            };
 
-        const { debugLogs = [] } = await chrome.storage.local.get('debugLogs');
-        debugLogs.push(logEntry);
-        if (debugLogs.length > 1000) debugLogs.shift();
-        await chrome.storage.local.set({ debugLogs });
+            const { debugLogs = [] } = await chrome.storage.local.get('debugLogs');
+            debugLogs.push(logEntry);
+            if (debugLogs.length > 1000) debugLogs.shift();
+            await chrome.storage.local.set({ debugLogs });
+        } catch (error) {
+            console.warn('Failed to save log to storage:', error.message);
+        }
     }
 
     static async getLogs() {
-        const { debugLogs = [] } = await chrome.storage.local.get('debugLogs');
-        return debugLogs;
+        try {
+            const { debugLogs = [] } = await chrome.storage.local.get('debugLogs');
+            return debugLogs;
+        } catch (error) {
+            console.error('Failed to get logs:', error);
+            return [];
+        }
     }
 
     static async clearLogs() {
-        await chrome.storage.local.remove('debugLogs');
+        try {
+            await chrome.storage.local.remove('debugLogs');
+        } catch (error) {
+            console.error('Failed to clear logs:', error);
+        }
     }
 
     async _sendToGraylog(level, message, data, location) {
         try {
-            // Get Graylog endpoint from settings
-            const { graylogEndpoint = this.defaultGraylogEndpoint } = await chrome.storage.sync.get('graylogEndpoint');
+            // Determine which endpoint to use based on facility
+            let graylogEndpoint;
+            let facility;
+            
+            if (this.prefix && this.prefix.startsWith('TEST-')) {
+                // Test extension - use default endpoint and test facility
+                graylogEndpoint = this.defaultGraylogEndpoint;
+                facility = 'test-race-chrome';
+            } else {
+                // Production extension - check storage for custom endpoint
+                const settings = await chrome.storage.sync.get('graylogEndpoint');
+                graylogEndpoint = settings.graylogEndpoint || this.defaultGraylogEndpoint;
+                facility = 'js_ext_scrap_universal';
+            }
             
             if (!graylogEndpoint) {
                 return; // No endpoint configured, skip logging
@@ -70,12 +163,12 @@ export default class Logger {
 
             const gelfMessage = {
                 version: '1.1',
-                host: 'browser_extension',
+                host: facility === 'test-race-chrome' ? 'test-race-extension' : 'browser_extension',
                 short_message: message,
                 full_message: data ? JSON.stringify(data) : message,
                 timestamp: Date.now() / 1000,
                 level: this._getGelfLevel(level),
-                facility: 'js_ext_scrap_universal',
+                facility: facility,
                 _prefix: this.prefix,
                 _location: location,
                 _data: data ? JSON.stringify(data) : null
@@ -90,7 +183,10 @@ export default class Logger {
             });
         } catch (error) {
             // Silently fail to avoid logging loops
-            console.warn('Failed to send log to Graylog:', error.message);
+            // Only log to console in development
+            if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'development') {
+                console.warn('Failed to send log to Graylog:', error.message);
+            }
         }
     }
 
@@ -103,4 +199,4 @@ export default class Logger {
             default: return 6;
         }
     }
-} 
+}
