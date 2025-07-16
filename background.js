@@ -576,11 +576,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         case 'content_log':
             // Log messages from content scripts
             const contentLogger = new Logger('CONTENT');
-            contentLogger.log(request.level || 'info', request.message, {
-                tabId: sender.tab?.id,
-                url: sender.tab?.url,
-                ...request.data
-            });
+            const level = request.level || 'info';
+            if (contentLogger[level]) {
+                contentLogger[level](request.message, {
+                    tabId: sender.tab?.id,
+                    url: sender.tab?.url,
+                    ...request.data
+                });
+            }
             break;
     }
     
