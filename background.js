@@ -113,7 +113,7 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
                 networkTracker.setTargetUrl(tab.id, url);
                 
                 processLogger.debug(`Process ${processId}: Waiting for tab load and security checks`);
-                await waitForTabLoad(tab.id);
+                await waitForTabLoad(tab.id, captureScreenshot);
                 
                 processLogger.debug(`Process ${processId}: Extracting content`);
                 const extractedContent = await extractContent(tab.id);
@@ -188,7 +188,13 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
             timeoutPromise
         ]);
     } catch (error) {
-        processLogger.error(`Process ${processId} failed`, error);
+        processLogger.error(`Process ${processId} failed`, {
+            error: error.message,
+            stack: error.stack,
+            tabId: tab?.id,
+            url: url,
+            isTimeout: error.message.includes('timeout')
+        });
         
         // Report error back to API
         try {
@@ -203,19 +209,29 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
             });
             processLogger.info(`Process ${processId}: Error reported to server`);
         } catch (reportError) {
-            processLogger.error(`Process ${processId}: Failed to report error`, reportError);
+            processLogger.error(`Process ${processId}: Failed to report error`, {
+                error: reportError.message,
+                originalError: error.message
+            });
         }
         
         throw error;
     } finally {
-        if (tab) {
-            processLogger.debug(`Process ${processId}: Closing tab`);
-            await chrome.tabs.remove(tab.id).catch(e => 
-                processLogger.error(`Failed to close tab`, e)
-            );
+        // Always cleanup
+        if (tab?.id) {
+            try {
+                await chrome.tabs.remove(tab.id);
+                processLogger.debug(`Process ${processId}: Closed tab ${tab.id} after processing`);
+            } catch (closeError) {
+                processLogger.warn(`Process ${processId}: Failed to close tab ${tab.id}`, {
+                    error: closeError.message
+                });
+            }
         }
-        // Clear processing state in StateLock
-        await stateLock.clearState('processing');
+        
+        // Always reset state
+        await stateLock.setState('idle');
+        processLogger.debug(`Process ${processId}: Reset state to idle`);
         isProcessing = false; // Keep for backward compatibility
         await saveState();
     }
@@ -226,19 +242,26 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
 const networkTracker = new NetworkRequestTracker();
 const screenshotCapture = new ScreenshotCapture();
 
-async function waitForTabLoad(tabId) {
+async function waitForTabLoad(tabId, captureScreenshot = true) {
     return new Promise((resolve, reject) => {
         chrome.tabs.onUpdated.addListener(function listener(id, info) {
             if (id === tabId && info.status === 'complete') {
                 chrome.tabs.onUpdated.removeListener(listener);
                 
-                // Increased timeout and added ignoreScreenshotCapture option
+                // Use shorter timeout for text-only mode
+                const networkTimeout = captureScreenshot ? 45000 : 30000;
+                const logger = new Logger('NetworkWait');
+                logger.info(`Waiting for network idle with ${networkTimeout}ms timeout`, {
+                    tabId,
+                    captureScreenshot
+                });
+                
                 networkTracker.waitForNetworkIdle(tabId, {
-                    timeout: 45000,        // Increase to 45 seconds
-                    quietPeriod: 2000,     // Reduce to 2 seconds
+                    timeout: networkTimeout,  // 45s for screenshots, 30s for text-only
+                    quietPeriod: 2000,       // 2 seconds quiet period
                     checkInterval: 100,
                     ignoreScreenshotCapture: true,
-                    maxActiveRequests: 2   // New: allow up to 2 active requests
+                    maxActiveRequests: 2     // Allow up to 2 active requests
                 })
                 .then(resolve)
                 .catch(reject);
@@ -301,8 +324,42 @@ async function pollServer(controlUrl) {
 
         if (data.url) {
             setStatus(`Processing URL: ${data.url}`);
-            await processUrl(data.url, controlUrl, data.capture_screenshot);
-            return true; // Continue polling after processing
+            try {
+                await processUrl(data.url, controlUrl, data.capture_screenshot);
+            } catch (processError) {
+                // Log with full context
+                pollLogger.error(`Processing failed for ${data.url}`, {
+                    error: processError.message,
+                    stack: processError.stack,
+                    url: data.url,
+                    isTimeout: processError.message.includes('timeout'),
+                    timestamp: new Date().toISOString()
+                });
+                
+                // Try to report to server (don't let this break polling)
+                try {
+                    const response = await fetch(controlUrl + '/report_error', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            url: data.url,
+                            error: processError.message,
+                            timestamp: new Date().toISOString()
+                        })
+                    });
+                    if (response.ok) {
+                        pollLogger.info('Error reported to server successfully');
+                    } else {
+                        pollLogger.warn(`Server error report failed with status ${response.status}`);
+                    }
+                } catch (reportError) {
+                    pollLogger.warn('Failed to report error to server', {
+                        error: reportError.message,
+                        originalError: processError.message
+                    });
+                }
+            }
+            return true; // Always continue polling
         }
         
         return true; // Continue polling
@@ -521,7 +578,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const contentLogger = new Logger('CONTENT');
             contentLogger.log(request.level || 'info', request.message, {
                 tabId: sender.tab?.id,
-                url: sender.tab?.url
+                url: sender.tab?.url,
+                ...request.data
             });
             break;
     }

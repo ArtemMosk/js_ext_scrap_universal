@@ -81,6 +81,15 @@ export default class NetworkRequestTracker {
             checkInterval = 100,
             maxActiveRequests = 2
         } = options;
+        
+        // Special handling for known problematic sites
+        const targetUrl = this.targetUrls.get(tabId);
+        if (targetUrl && targetUrl.includes('williamspaniel.com')) {
+            this.logger.warn('Special network handling for williamspaniel.com', { tabId });
+            // Reduce timeout and increase tolerance for this site
+            options.timeout = 15000; // 15 seconds max
+            options.maxActiveRequests = 5; // Allow more concurrent requests
+        }
 
         if (!this.targetUrls.has(tabId)) {
             throw new Error('No target URL set for tab');
@@ -100,14 +109,26 @@ export default class NetworkRequestTracker {
             const checkQuietPeriod = () => {
                 const requests = this.activeRequests.get(tabId);
                 const currentCount = requests ? requests.size : 0;
+                const elapsedTime = Date.now() - startTime;
                 
                 if (currentCount !== lastRequestCount) {
                     this.logger.debug(`Active requests changed`, { 
                         tabId, 
                         activeRequests: currentCount,
-                        urls: Array.from(requests?.values() || []).map(r => r.url)
+                        urls: Array.from(requests?.values() || []).map(r => r.url),
+                        elapsedTime: elapsedTime
                     });
                     lastRequestCount = currentCount;
+                }
+                
+                // Log every 5 seconds for long-running waits
+                if (elapsedTime % 5000 < checkInterval) {
+                    this.logger.info(`Still waiting for network idle`, {
+                        tabId,
+                        activeRequests: currentCount,
+                        elapsedTime: elapsedTime,
+                        targetUrl: targetUrl
+                    });
                 }
 
                 if (currentCount <= maxActiveRequests) {
@@ -135,12 +156,24 @@ export default class NetworkRequestTracker {
                 if (Date.now() - startTime >= timeout) {
                     clearInterval(intervalId);
                     this.cleanup(tabId);
-                    this.logger.debug(`Network idle timeout`, { 
+                    
+                    // Log detailed timeout info
+                    const activeUrls = Array.from(requests?.values() || []).map(r => r.url);
+                    this.logger.error(`Network idle timeout`, { 
                         tabId,
                         activeRequests: currentCount,
-                        urls: Array.from(requests?.values() || []).map(r => r.url)
+                        urls: activeUrls,
+                        targetUrl: targetUrl,
+                        totalWaitTime: Date.now() - startTime
                     });
-                    reject(new Error('Network idle timeout'));
+                    
+                    // Don't reject for known problematic sites, just resolve
+                    if (targetUrl && targetUrl.includes('williamspaniel.com')) {
+                        this.logger.warn('Forcing completion for williamspaniel.com despite active requests');
+                        resolve();
+                    } else {
+                        reject(new Error('Network idle timeout'));
+                    }
                 }
             };
 

@@ -7,18 +7,55 @@ chrome.runtime.sendMessage({
     level: 'info'
 });
 
+// Helper function for logging
+function logToBackground(level, message, data = {}) {
+    chrome.runtime.sendMessage({
+        type: 'content_log',
+        level: level,
+        message: message,
+        data: data
+    });
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.type === "extract_content") {
         // Add extraction start logging
         console.log('[CONTENT_EXTRACTOR] Starting content extraction for:', window.location.href);
         
-        // Also log to background
-        chrome.runtime.sendMessage({
-            type: 'content_log',
-            message: `Starting content extraction for ${window.location.href}`,
-            level: 'info'
-        });
         const extractionStartTime = Date.now();
+        
+        // Log initial state
+        logToBackground('info', `Starting content extraction`, {
+            url: window.location.href,
+            readyState: document.readyState,
+            documentLength: document.documentElement.innerHTML.length,
+            hostname: window.location.hostname
+        });
+        
+        // Special logging for problematic sites
+        if (window.location.hostname.includes('williamspaniel.com')) {
+            logToBackground('warn', 'Processing problematic site: williamspaniel.com', {
+                imagesCount: document.images.length,
+                scriptsCount: document.scripts.length,
+                iframesCount: document.querySelectorAll('iframe').length,
+                bodyHeight: document.body ? document.body.scrollHeight : 0
+            });
+            
+            // Add periodic health checks to see where it hangs
+            let checkCount = 0;
+            const healthInterval = setInterval(() => {
+                checkCount++;
+                logToBackground('debug', `Williamspaniel health check #${checkCount}`, {
+                    bodyHeight: document.body.scrollHeight,
+                    activeRequests: performance.getEntriesByType('resource').length,
+                    readyState: document.readyState
+                });
+                
+                if (checkCount > 10) {
+                    clearInterval(healthInterval);
+                }
+            }, 3000); // Every 3 seconds
+        }
         
         // Detect infinite scroll or dynamic loading
         const detectInfiniteScroll = () => {
@@ -37,6 +74,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const hasInfiniteScroll = indicators.some(indicator => !!indicator);
             if (hasInfiniteScroll) {
                 console.warn('[CONTENT_EXTRACTOR] Detected possible infinite scroll on:', window.location.href);
+                logToBackground('warn', 'Detected possible infinite scroll', {
+                    scrollHeight: document.body.scrollHeight,
+                    windowHeight: window.innerHeight,
+                    ratio: document.body.scrollHeight / window.innerHeight
+                });
             }
             return hasInfiniteScroll;
         };
@@ -57,6 +99,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             ];
             
             console.log('[CONTENT_EXTRACTOR] Trying content selectors...');
+            logToBackground('debug', 'Starting main content detection', {
+                selectors: contentSelectors.length,
+                documentLength: document.body.innerHTML.length
+            });
 
             // Try to find the main content element with timeout protection
             let mainContent = null;
@@ -74,10 +120,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     if (element) {
                         console.log('[CONTENT_EXTRACTOR] Found content with selector:', selector);
                         mainContent = element;
+                        logToBackground('info', 'Main content detected', {
+                            selector: selector,
+                            element: element.tagName,
+                            className: element.className,
+                            contentLength: element.innerText?.length || 0
+                        });
                         break;
                     }
                 } catch (e) {
                     console.error('[CONTENT_EXTRACTOR] Error with selector:', selector, e);
+                    logToBackground('warn', 'Selector error', {
+                        selector: selector,
+                        error: e.message
+                    });
                 }
             }
 
@@ -133,6 +189,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.log('[CONTENT_EXTRACTOR] Removing non-essential elements...');
             const removeStartTime = Date.now();
             
+            logToBackground('debug', 'Starting content purification', {
+                originalElements: element ? element.querySelectorAll('*').length : 0
+            });
+            
             // Limit clone size to prevent memory issues
             let clone;
             try {
@@ -177,6 +237,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         
         setTimeout(() => {
             console.error('[CONTENT_EXTRACTOR] Total extraction timeout after', EXTRACTION_TIMEOUT, 'ms');
+            logToBackground('error', 'Content extraction timeout', {
+                timeout: EXTRACTION_TIMEOUT,
+                url: window.location.href
+            });
             sendResponse({ 
                 content: {
                     rawHtml: '<html><body>Extraction timeout</body></html>',
@@ -240,9 +304,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.log('[CONTENT_EXTRACTOR] Extraction completed in', content.extractionTime, 'ms');
             console.log('[CONTENT_EXTRACTOR] Content sizes - HTML:', htmlContent.length, 'Raw:', rawPurifiedText.length, 'Readable:', readableText.length);
             
+            logToBackground('info', 'Content extraction completed successfully', {
+                extractionTime: content.extractionTime,
+                htmlSize: htmlContent.length,
+                rawTextSize: rawPurifiedText.length,
+                readableTextSize: readableText.length,
+                hasInfiniteScroll: hasInfiniteScroll,
+                elementCount: document.querySelectorAll('*').length
+            });
+            
             sendResponse({ content });
         } catch (error) {
             console.error('[CONTENT_EXTRACTOR] Extraction failed:', error);
+            logToBackground('error', 'Content extraction failed', {
+                error: error.message,
+                stack: error.stack,
+                url: window.location.href
+            });
             sendResponse({ 
                 content: {
                     rawHtml: '<html><body>Extraction error</body></html>',
