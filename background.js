@@ -81,9 +81,9 @@ async function fetchWithTimeout(url, options = {}, timeout = 5000) {
     }
 }
 
-async function processUrl(url, controlUrl) {
+async function processUrl(url, controlUrl, captureScreenshot = true) {
     const processId = Date.now();
-    processLogger.info(`Starting URL processing ${processId}`, { url });
+    processLogger.info(`Starting URL processing ${processId}`, { url, captureScreenshot });
     
     // Set processing state in StateLock
     await stateLock.setState('processing', {
@@ -96,81 +96,116 @@ async function processUrl(url, controlUrl) {
     let tab = null;
     let formattedContent = null;
     
+    // Create timeout promise (5 minutes)
+    const PROCESSING_TIMEOUT = 300000; // 5 minutes max
+    const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`Processing timeout after ${PROCESSING_TIMEOUT/1000} seconds`)), PROCESSING_TIMEOUT);
+    });
+    
     try {
-        processLogger.debug(`Process ${processId}: Creating tab`);
-        tab = await chrome.tabs.create({ url, active: true });
-        
-        // Set target URL before waiting for network idle
-        networkTracker.setTargetUrl(tab.id, url);
-        
-        processLogger.debug(`Process ${processId}: Waiting for tab load and security checks`);
-        await waitForTabLoad(tab.id);
-        
-        processLogger.debug(`Process ${processId}: Extracting content`);
-        const extractedContent = await extractContent(tab.id);
-        
-        // Wait additional time for any dynamic content
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        processLogger.debug(`Process ${processId}: Capturing full page screenshot`);
-        const screenshotCapture = new ScreenshotCapture();
-        const screenshot = await screenshotCapture.captureFullPage(tab.id);
-        
-        // Format the content according to server's expected schema
-        formattedContent = {
-            url: url,
-            transformedUrl: extractedContent.url,
-            content: {
-                rawHtml: extractedContent.rawHtml,
-                rawPurifiedContent: extractedContent.rawPurifiedContent,
-                readableContent: extractedContent.readableContent,
-                title: extractedContent.title,
-                screenshot: screenshot
-            }
-        };
+        // Race between actual processing and timeout
+        formattedContent = await Promise.race([
+            (async () => {
+                processLogger.debug(`Process ${processId}: Creating tab`);
+                tab = await chrome.tabs.create({ url, active: true });
+                
+                // Set target URL before waiting for network idle
+                networkTracker.setTargetUrl(tab.id, url);
+                
+                processLogger.debug(`Process ${processId}: Waiting for tab load and security checks`);
+                await waitForTabLoad(tab.id);
+                
+                processLogger.debug(`Process ${processId}: Extracting content`);
+                const extractedContent = await extractContent(tab.id);
+                
+                // Wait additional time for any dynamic content
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                let screenshot = null;
+                if (captureScreenshot) {
+                    processLogger.debug(`Process ${processId}: Capturing full page screenshot`);
+                    const screenshotCapture = new ScreenshotCapture();
+                    screenshot = await screenshotCapture.captureFullPage(tab.id);
+                } else {
+                    processLogger.info(`Process ${processId}: Skipping screenshot capture (text-only mode)`);
+                }
+                
+                // Format the content according to server's expected schema
+                const contentData = {
+                    url: url,
+                    transformedUrl: extractedContent.url,
+                    content: {
+                        rawHtml: extractedContent.rawHtml,
+                        rawPurifiedContent: extractedContent.rawPurifiedContent,
+                        readableContent: extractedContent.readableContent,
+                        title: extractedContent.title,
+                        screenshot: screenshot
+                    }
+                };
 
-        // Log preview of content
-        processLogger.info(`Process ${processId}: Content preview`, {
-            originalUrl: formattedContent.url,
-            transformedUrl: formattedContent.transformedUrl,
-            titleLength: formattedContent.content.title?.length,
-            contentLength: formattedContent.content.readableContent?.length,
-            screenshotSize: formattedContent.content.screenshot?.length,
-            contentPreview: formattedContent.content.readableContent?.substring(0, 100)
-        });
+                // Log preview of content
+                processLogger.info(`Process ${processId}: Content preview`, {
+                    originalUrl: contentData.url,
+                    transformedUrl: contentData.transformedUrl,
+                    titleLength: contentData.content.title?.length,
+                    contentLength: contentData.content.readableContent?.length,
+                    screenshotSize: contentData.content.screenshot?.length,
+                    contentPreview: contentData.content.readableContent?.substring(0, 100)
+                });
 
-        // Send to server with detailed logging
-        try {
-            processLogger.debug(`Process ${processId}: Sending to server`, {
-                endpoint: controlUrl,
-                contentSize: JSON.stringify(formattedContent).length
-            });
+                // Send to server with detailed logging
+                try {
+                    processLogger.debug(`Process ${processId}: Sending to server`, {
+                        endpoint: controlUrl,
+                        contentSize: JSON.stringify(contentData).length
+                    });
 
-            const response = await fetch(controlUrl + '/submit', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(formattedContent)
-            });
+                    const response = await fetch(controlUrl + '/submit', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(contentData)
+                    });
 
-            const responseData = await response.text();
-            processLogger.info(`Process ${processId}: Server response`, {
-                status: response.status,
-                responsePreview: responseData.substring(0, 100)
-            });
+                    const responseData = await response.text();
+                    processLogger.info(`Process ${processId}: Server response`, {
+                        status: response.status,
+                        responsePreview: responseData.substring(0, 100)
+                    });
 
-            if (!response.ok) {
-                throw new Error(`Server responded with ${response.status}: ${responseData}`);
-            }
-        } catch (serverError) {
-            processLogger.error(`Process ${processId}: Server communication failed`, serverError);
-            throw serverError;
-        }
+                    if (!response.ok) {
+                        throw new Error(`Server responded with ${response.status}: ${responseData}`);
+                    }
+                } catch (serverError) {
+                    processLogger.error(`Process ${processId}: Server communication failed`, serverError);
+                    throw serverError;
+                }
         
-        processLogger.info(`Process ${processId}: Processing completed successfully`);
+                processLogger.info(`Process ${processId}: Processing completed successfully`);
+                return contentData;
+            })(),
+            timeoutPromise
+        ]);
     } catch (error) {
         processLogger.error(`Process ${processId} failed`, error);
+        
+        // Report error back to API
+        try {
+            await fetch(controlUrl + '/report_error', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: url,
+                    error: error.message,
+                    timestamp: new Date().toISOString()
+                })
+            });
+            processLogger.info(`Process ${processId}: Error reported to server`);
+        } catch (reportError) {
+            processLogger.error(`Process ${processId}: Failed to report error`, reportError);
+        }
+        
         throw error;
     } finally {
         if (tab) {
@@ -266,7 +301,7 @@ async function pollServer(controlUrl) {
 
         if (data.url) {
             setStatus(`Processing URL: ${data.url}`);
-            await processUrl(data.url, controlUrl);
+            await processUrl(data.url, controlUrl, data.capture_screenshot);
             return true; // Continue polling after processing
         }
         
@@ -478,6 +513,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             messageLogger.debug('Logs requested');
             Logger.getLogs().then(logs => {
                 sendResponse(logs);
+            });
+            break;
+            
+        case 'content_log':
+            // Log messages from content scripts
+            const contentLogger = new Logger('CONTENT');
+            contentLogger.log(request.level || 'info', request.message, {
+                tabId: sender.tab?.id,
+                url: sender.tab?.url
             });
             break;
     }
