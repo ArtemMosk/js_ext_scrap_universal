@@ -82,14 +82,6 @@ export default class NetworkRequestTracker {
             maxActiveRequests = 2
         } = options;
         
-        // Special handling for known problematic sites
-        const targetUrl = this.targetUrls.get(tabId);
-        if (targetUrl && targetUrl.includes('williamspaniel.com')) {
-            this.logger.warn('Special network handling for williamspaniel.com', { tabId });
-            // Reduce timeout and increase tolerance for this site
-            options.timeout = 15000; // 15 seconds max
-            options.maxActiveRequests = 5; // Allow more concurrent requests
-        }
 
         if (!this.targetUrls.has(tabId)) {
             throw new Error('No target URL set for tab');
@@ -167,13 +159,7 @@ export default class NetworkRequestTracker {
                         totalWaitTime: Date.now() - startTime
                     });
                     
-                    // Don't reject for known problematic sites, just resolve
-                    if (targetUrl && targetUrl.includes('williamspaniel.com')) {
-                        this.logger.warn('Forcing completion for williamspaniel.com despite active requests');
-                        resolve();
-                    } else {
-                        reject(new Error('Network idle timeout'));
-                    }
+                    reject(new Error('Network idle timeout'));
                 }
             };
 

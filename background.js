@@ -96,8 +96,8 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
     let tab = null;
     let formattedContent = null;
     
-    // Create timeout promise (5 minutes)
-    const PROCESSING_TIMEOUT = 300000; // 5 minutes max
+    // Create timeout promise (8 minutes to match Python's timeout)
+    const PROCESSING_TIMEOUT = 480000; // 8 minutes max
     const timeoutPromise = new Promise((_, reject) => {
         setTimeout(() => reject(new Error(`Processing timeout after ${PROCESSING_TIMEOUT/1000} seconds`)), PROCESSING_TIMEOUT);
     });
@@ -248,8 +248,8 @@ async function waitForTabLoad(tabId, captureScreenshot = true) {
             if (id === tabId && info.status === 'complete') {
                 chrome.tabs.onUpdated.removeListener(listener);
                 
-                // Use shorter timeout for text-only mode
-                const networkTimeout = captureScreenshot ? 45000 : 30000;
+                // Use 30s timeout for all modes
+                const networkTimeout = 30000;
                 const logger = new Logger('NetworkWait');
                 logger.info(`Waiting for network idle with ${networkTimeout}ms timeout`, {
                     tabId,
@@ -257,7 +257,7 @@ async function waitForTabLoad(tabId, captureScreenshot = true) {
                 });
                 
                 networkTracker.waitForNetworkIdle(tabId, {
-                    timeout: networkTimeout,  // 45s for screenshots, 30s for text-only
+                    timeout: networkTimeout,  // 30s for all modes
                     quietPeriod: 2000,       // 2 seconds quiet period
                     checkInterval: 100,
                     ignoreScreenshotCapture: true,
