@@ -243,30 +243,68 @@ const networkTracker = new NetworkRequestTracker();
 const screenshotCapture = new ScreenshotCapture();
 
 async function waitForTabLoad(tabId, captureScreenshot = true) {
+    const pageLoadTimeout = 30000; // 30 seconds max for initial page load
+    const waitLogger = new Logger('TabWait');
+    
     return new Promise((resolve, reject) => {
-        chrome.tabs.onUpdated.addListener(function listener(id, info) {
+        let listenerRemoved = false;
+        
+        // Define the listener function so we can remove it later
+        const listener = function(id, info) {
             if (id === tabId && info.status === 'complete') {
-                chrome.tabs.onUpdated.removeListener(listener);
-                
-                // Use 30s timeout for all modes
-                const networkTimeout = 30000;
-                const logger = new Logger('NetworkWait');
-                logger.info(`Waiting for network idle with ${networkTimeout}ms timeout`, {
-                    tabId,
-                    captureScreenshot
-                });
-                
-                networkTracker.waitForNetworkIdle(tabId, {
-                    timeout: networkTimeout,  // 30s for all modes
-                    quietPeriod: 2000,       // 2 seconds quiet period
-                    checkInterval: 100,
-                    ignoreScreenshotCapture: true,
-                    maxActiveRequests: 2     // Allow up to 2 active requests
-                })
-                .then(resolve)
-                .catch(reject);
+                if (!listenerRemoved) {
+                    listenerRemoved = true;
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    waitLogger.info('Page reached complete status normally', { tabId });
+                    proceedWithNetworkWait('complete');
+                }
             }
-        });
+        };
+        
+        // Add the listener
+        chrome.tabs.onUpdated.addListener(listener);
+        
+        // Set up timeout for page load
+        const timeoutId = setTimeout(() => {
+            if (!listenerRemoved) {
+                listenerRemoved = true;
+                chrome.tabs.onUpdated.removeListener(listener);
+                waitLogger.warn('Page load timeout - proceeding with partial content', { 
+                    tabId, 
+                    timeout: pageLoadTimeout 
+                });
+                proceedWithNetworkWait('timeout');
+            }
+        }, pageLoadTimeout);
+        
+        // Function to proceed with network wait
+        function proceedWithNetworkWait(loadResult) {
+            clearTimeout(timeoutId);
+            
+            // Use 30s timeout for all modes
+            const networkTimeout = 30000;
+            waitLogger.info(`Waiting for network idle after ${loadResult}`, {
+                tabId,
+                captureScreenshot,
+                networkTimeout
+            });
+            
+            networkTracker.waitForNetworkIdle(tabId, {
+                timeout: networkTimeout,  // 30s for all modes
+                quietPeriod: 2000,       // 2 seconds quiet period
+                checkInterval: 100,
+                ignoreScreenshotCapture: true,
+                maxActiveRequests: 2     // Allow up to 2 active requests
+            })
+            .then(() => {
+                waitLogger.info('Network idle achieved', { tabId, loadResult });
+                resolve();
+            })
+            .catch((error) => {
+                waitLogger.error('Network wait failed', { tabId, error: error.message });
+                reject(error);
+            });
+        }
     });
 }
 
