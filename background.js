@@ -4,6 +4,7 @@ import Logger from './logger.js';
 import NetworkRequestTracker from './networkRequestTracker.js';
 import ScreenshotCapture from './backgroundScreenshotHandler.js';
 import { StateLock } from './stateLock.js';
+import { runInteractionTask } from './interactionRunner.js';
 
 // Loggers for different components
 const logger = new Logger();
@@ -242,6 +243,32 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
 const networkTracker = new NetworkRequestTracker();
 const screenshotCapture = new ScreenshotCapture();
 
+async function processInteractionTask(task, controlUrl) {
+    const processId = Date.now();
+    processLogger.info(`Starting interaction task ${processId}`, {
+        taskId: task.task_id, taskString: task.task_string
+    });
+
+    await stateLock.setState('processing', {
+        url: `interaction:${task.task_id}`,
+        processId: processId,
+        startTime: Date.now()
+    });
+    isProcessing = true;
+    await saveState();
+
+    try {
+        // Timeout/cleanup/result-reporting (incl. failure submission to /submit_task)
+        // are handled inside runInteractionTask via its deadline.
+        await runInteractionTask(task, controlUrl, { waitForTabLoad, networkTracker });
+        processLogger.info(`Interaction task ${processId} completed`, { taskId: task.task_id });
+    } finally {
+        await stateLock.setState('idle');
+        isProcessing = false;
+        await saveState();
+    }
+}
+
 async function waitForTabLoad(tabId, captureScreenshot = true) {
     const pageLoadTimeout = 30000; // 30 seconds max for initial page load
     const waitLogger = new Logger('TabWait');
@@ -359,6 +386,22 @@ async function pollServer(controlUrl) {
 
         const data = await response.json();
         pollLogger.info(`Poll ${pollId}: Received URL`, { url: data.url });
+
+        if (data.type === 'interaction_task' && data.task) {
+            setStatus(`Processing interaction task: ${data.task.task_id}`);
+            try {
+                await processInteractionTask(data.task, controlUrl);
+            } catch (taskError) {
+                // Failure was already submitted to /submit_task by the runner;
+                // log here and keep polling.
+                pollLogger.error(`Interaction task failed: ${data.task.task_id}`, {
+                    error: taskError.message,
+                    stack: taskError.stack,
+                    timestamp: new Date().toISOString()
+                });
+            }
+            return true; // Continue polling
+        }
 
         if (data.url) {
             setStatus(`Processing URL: ${data.url}`);
