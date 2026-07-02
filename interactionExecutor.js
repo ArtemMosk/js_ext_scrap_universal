@@ -22,8 +22,11 @@ function elementArea(el) {
     return w * h;
 }
 
-function resolveElements(selector, pick = 'first') {
-    const nodes = Array.from(document.querySelectorAll(selector));
+function resolveElements(selector, pick = 'first', excludeWithin = null) {
+    let nodes = Array.from(document.querySelectorAll(selector));
+    // Drop elements inside an excluded ancestor (e.g. the ChatGPT user turn, so an
+    // uploaded reference image is never mistaken for the generated image).
+    if (excludeWithin) nodes = nodes.filter(n => !n.closest(excludeWithin));
     if (nodes.length === 0) return [];
     switch (pick) {
         case 'last': return [nodes[nodes.length - 1]];
@@ -46,12 +49,12 @@ function isDisabled(el) {
 }
 
 function handleCheck(step) {
-    const els = resolveElements(step.selector, step.pick || 'first');
+    const els = resolveElements(step.selector, step.pick || 'first', step.exclude_within);
     const el = els[0] || null;
     return {
         ok: true,
         exists: !!el,
-        count: document.querySelectorAll(step.selector).length,
+        count: els.length,
         visible: isVisible(el),
         disabled: el ? isDisabled(el) : null,
         textLength: el ? (el.innerText || '').length : 0,
@@ -213,7 +216,7 @@ function blobToDataURL(blob) {
 // src_url + a flag so interactionRunner.js re-fetches from the background service
 // worker (host_permissions bypass CORS there).
 async function handleExtractImage(step) {
-    const els = resolveElements(step.selector, step.pick || 'last');
+    const els = resolveElements(step.selector, step.pick || 'last', step.exclude_within);
     const el = els.find(e => e.tagName === 'IMG') || els[0];
     if (!el) return { ok: false, error: `extractImage: no element matches "${step.selector}"` };
     const src = el.currentSrc || el.src || el.getAttribute('src');
@@ -244,6 +247,92 @@ async function handleExtractImage(step) {
     }
 }
 
+const UPLOAD_VERIFY_TIMEOUT_MS = 15000;
+
+function dataUrlToFile(dataUrl, name) {
+    const m = /^data:([^;,]*)[^,]*,(.*)$/s.exec(dataUrl || '');
+    if (!m) throw new Error('malformed data_url');
+    const mime = m[1] || 'image/png';
+    const bin = atob(m[2]);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new File([arr], name || 'ref.png', { type: mime });
+}
+
+// Count independent signals that an attachment actually rendered in the composer.
+// Multi-signal so we don't depend on one fragile ChatGPT class/testid.
+function attachmentSignals(baselineBlobImgs) {
+    return {
+        blobImgsDelta: document.querySelectorAll('img[src^="blob:"]').length - baselineBlobImgs,
+        attachTestids: document.querySelectorAll('[data-testid*="attachment" i], [data-testid*="file-upload" i]').length,
+        removeBtns: document.querySelectorAll('button[aria-label*="remove" i], button[aria-label*="delete file" i]').length
+    };
+}
+
+// Upload reference image(s) into a file <input> via DataTransfer (the same mechanism
+// Playwright's setInputFiles uses), then VERIFY the attachment previews appear.
+// Returns ok:false (fail-loud) if nothing attaches, with the raw signal counts so the
+// caller/server can diagnose without a live DOM probe.
+async function handleUploadFile(step) {
+    const inputs = Array.from(document.querySelectorAll(step.selector || 'input[type="file"]'));
+    const input = inputs.find(i => (i.getAttribute('accept') || '').includes('image')) || inputs[inputs.length - 1];
+    if (!input) return { ok: false, error: `uploadFile: no file input matches "${step.selector || 'input[type=file]'}"` };
+    if (!Array.isArray(step.files) || step.files.length === 0) return { ok: false, error: 'uploadFile: no files provided' };
+
+    const baseline = document.querySelectorAll('img[src^="blob:"]').length;
+    const dt = new DataTransfer();
+    for (let i = 0; i < step.files.length; i++) {
+        try {
+            dt.items.add(dataUrlToFile(step.files[i].data_url, step.files[i].name || `ref_${i}.png`));
+        } catch (e) {
+            return { ok: false, error: `uploadFile: file ${i} decode failed: ${e.message}` };
+        }
+    }
+    const n = dt.files.length;
+    try {
+        input.files = dt.files;
+    } catch (e) {
+        return { ok: false, error: `uploadFile: cannot set files on input: ${e.message}` };
+    }
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const until = Date.now() + (step.verify_timeout_ms || UPLOAD_VERIFY_TIMEOUT_MS);
+    let sig = attachmentSignals(baseline);
+    while (Date.now() < until) {
+        sig = attachmentSignals(baseline);
+        if (sig.blobImgsDelta >= n || sig.attachTestids >= n || sig.removeBtns >= n) {
+            logInteraction('info', 'uploadFile verified', { attached: n, signals: sig });
+            return { ok: true, attached: n, verified: true, signals: sig };
+        }
+        await new Promise(r => setTimeout(r, 400));
+    }
+    return {
+        ok: false, attached: n, verified: false, signals: sig,
+        error: `uploadFile: attachments not confirmed (attached ${n}, signals ${JSON.stringify(sig)})`
+    };
+}
+
+// Diagnostic: dump the page's images (size, src scheme/head, which turn) + composer state.
+// Returned as JSON text so the server/caller can see ChatGPT's real DOM without CDP.
+function handleProbe(step) {
+    const imgs = Array.from(document.querySelectorAll('img')).map(i => ({
+        w: i.naturalWidth, h: i.naturalHeight,
+        scheme: (i.currentSrc || i.src || '').split(':')[0],
+        head: (i.currentSrc || i.src || '').slice(0, 70),
+        assistant: !!i.closest('[data-message-author-role="assistant"]'),
+        user: !!i.closest('[data-message-author-role="user"]')
+    }));
+    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'))
+        .map(i => ({ accept: i.getAttribute('accept'), files: i.files ? i.files.length : 0 }));
+    return { ok: true, data: { text: JSON.stringify({
+        url: location.href,
+        stopButton: !!document.querySelector('button[data-testid="stop-button"]'),
+        sendDisabled: (() => { const b = document.querySelector('#composer-submit-button, button[data-testid="send-button"]'); return b ? (b.disabled || b.getAttribute('aria-disabled')) : 'no-send-btn'; })(),
+        fileInputs, imgs
+    }) } };
+}
+
 async function dispatchStep(step) {
     switch (step.action) {
         case 'check':        return handleCheck(step);
@@ -252,6 +341,8 @@ async function dispatchStep(step) {
         case 'press':        return handlePress(step);
         case 'extract':      return handleExtract(step);
         case 'extractImage': return await handleExtractImage(step);
+        case 'uploadFile':   return await handleUploadFile(step);
+        case 'probe':        return handleProbe(step);
         default:             return { ok: false, error: `Unknown interaction action: ${step.action}` };
     }
 }

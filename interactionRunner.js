@@ -85,8 +85,10 @@ async function waitForState(tabId, step, index, deadline) {
         const res = await sendStep(tabId, { action: 'check', selector: step.selector, pick: step.pick });
         // optional size gate: wait for an actually-large image (skip spinners/placeholders)
         const bigEnough = !step.min_natural_width || (res.naturalWidth || 0) >= step.min_natural_width;
+        // optional count gate: wait until >= N elements match (e.g. N attachment previews)
+        const countOk = !step.min_count || (res.count || 0) >= step.min_count;
         const satisfied =
-            state === 'visible' ? (res.exists && res.visible && bigEnough) :
+            state === 'visible' ? (res.exists && res.visible && bigEnough && countOk) :
             state === 'hidden' ? (!res.exists || !res.visible) :
             state === 'attached' ? res.exists :
             state === 'detached' ? !res.exists :
@@ -222,16 +224,18 @@ export async function runInteractionTask(task, controlUrl, deps) {
                         await clickWithEnableWait(tabId, step, i, deadline);
                         break;
                     case 'type':
-                    case 'press': {
+                    case 'press':
+                    case 'uploadFile': {
                         const res = await sendStep(tabId, step);
                         if (!res.ok) throw new StepError(i, step, res.error);
                         break;
                     }
-                    case 'extract': {
+                    case 'extract':
+                    case 'probe': {
                         const res = await sendStep(tabId, step);
                         if (!res.ok) throw new StepError(i, step, res.error);
                         items.push({
-                            name: step.as || `extract_${i}`,
+                            name: step.as || `${step.action}_${i}`,
                             content: res.data.text !== undefined ? res.data.text : JSON.stringify(res.data),
                             source_url: res.data.url || null,
                             title: res.data.title || null

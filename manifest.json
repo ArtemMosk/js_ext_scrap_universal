@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Universal Web Scraper",
-  "version": "1.1",
+  "version": "1.2.2",
+  "version_name": "1.2.2 \u2014 exclude_within (ref/generated disambiguation)",
   "permissions": [
     "alarms",
     "scripting",
@@ -12,7 +13,9 @@
     "webRequest",
     "tabs"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -27,8 +30,14 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["contentExtractor.js", "screenshotCapture.js", "interactionExecutor.js"]
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "contentExtractor.js",
+        "screenshotCapture.js",
+        "interactionExecutor.js"
+      ]
     }
   ]
 }

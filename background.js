@@ -41,6 +41,11 @@ const defaultSettings = {
     graylogEndpoint: 'https://gelf.pt.artemm.info/gelf'
 };
 
+// Auto-start: when no controlUrl is stored, poll this server on load. Lets the
+// extension work in a browser we can't configure post-launch (default-profile
+// Chrome blocks remote debugging). Empty string = disabled (normal behaviour).
+const AUTOSTART_CONTROL_URL = 'http://100.107.180.35:8010';
+
 // Direct status setter without logging
 function setStatus(status) {
     statusLogger.info('Status changing', { from: currentStatus, to: status });
@@ -368,7 +373,8 @@ async function pollServer(controlUrl) {
     
     try {
         pollLogger.debug(`Poll ${pollId}: Fetching from server`);
-        const response = await fetchWithTimeout(`${controlUrl}/get_url`, {}, 30000);
+        const extVersion = chrome.runtime.getManifest().version;
+        const response = await fetchWithTimeout(`${controlUrl}/get_url?v=${encodeURIComponent(extVersion)}&client=extension`, {}, 30000);
         
         pollLogger.debug(`Poll ${pollId}: Response received`, { 
             status: response.status,
@@ -517,6 +523,13 @@ async function initializeExtension() {
         if (settings.controlUrl && settings.pollInterval) {
             initLogger.info('Starting polling with stored settings', settings);
             await startPollingWithSettings(settings);
+        } else if (AUTOSTART_CONTROL_URL) {
+            const auto = { controlUrl: AUTOSTART_CONTROL_URL, pollInterval: 30 };
+            initLogger.info('No stored settings — AUTO-STARTING polling', auto);
+            // Persist so the revive-alarm (which reads storage) can restart polling
+            // after the MV3 service worker idles — otherwise polling dies permanently.
+            await chrome.storage.sync.set(auto);
+            await startPollingWithSettings(auto);
         } else {
             initLogger.info('Waiting for configuration - no stored settings');
         }
