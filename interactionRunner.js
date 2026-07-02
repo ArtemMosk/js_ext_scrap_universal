@@ -83,8 +83,10 @@ async function waitForState(tabId, step, index, deadline) {
 
     while (Date.now() < until) {
         const res = await sendStep(tabId, { action: 'check', selector: step.selector, pick: step.pick });
+        // optional size gate: wait for an actually-large image (skip spinners/placeholders)
+        const bigEnough = !step.min_natural_width || (res.naturalWidth || 0) >= step.min_natural_width;
         const satisfied =
-            state === 'visible' ? (res.exists && res.visible) :
+            state === 'visible' ? (res.exists && res.visible && bigEnough) :
             state === 'hidden' ? (!res.exists || !res.visible) :
             state === 'attached' ? res.exists :
             state === 'detached' ? !res.exists :

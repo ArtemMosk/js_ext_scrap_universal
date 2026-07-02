@@ -15,12 +15,20 @@ function logInteraction(level, message, data = {}) {
 const EXTRACT_ELEMENT_LIMIT = 500000;  // 500KB per element, mirrors contentExtractor.js
 const EXTRACT_PAGE_LIMIT = 1000000;    // 1MB for full-page text
 
+function elementArea(el) {
+    // prefer intrinsic image size (a generated image is far bigger than icons/avatars)
+    const w = el.naturalWidth || el.clientWidth || 0;
+    const h = el.naturalHeight || el.clientHeight || 0;
+    return w * h;
+}
+
 function resolveElements(selector, pick = 'first') {
     const nodes = Array.from(document.querySelectorAll(selector));
     if (nodes.length === 0) return [];
     switch (pick) {
         case 'last': return [nodes[nodes.length - 1]];
         case 'all': return nodes;
+        case 'largest': return [nodes.reduce((a, b) => (elementArea(b) > elementArea(a) ? b : a))];
         case 'first':
         default: return [nodes[0]];
     }
@@ -47,7 +55,9 @@ function handleCheck(step) {
         visible: isVisible(el),
         disabled: el ? isDisabled(el) : null,
         textLength: el ? (el.innerText || '').length : 0,
-        textHash: el ? simpleHash(el.innerText || '') : null
+        textHash: el ? simpleHash(el.innerText || '') : null,
+        naturalWidth: el ? (el.naturalWidth || 0) : 0,
+        naturalHeight: el ? (el.naturalHeight || 0) : 0
     };
 }
 
