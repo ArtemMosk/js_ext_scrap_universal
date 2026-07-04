@@ -22,11 +22,14 @@ function elementArea(el) {
     return w * h;
 }
 
-function resolveElements(selector, pick = 'first', excludeWithin = null) {
+function resolveElements(selector, pick = 'first', excludeWithin = null, minWidth = 0) {
     let nodes = Array.from(document.querySelectorAll(selector));
     // Drop elements inside an excluded ancestor (e.g. the ChatGPT user turn, so an
     // uploaded reference image is never mistaken for the generated image).
     if (excludeWithin) nodes = nodes.filter(n => !n.closest(excludeWithin));
+    // Optional size filter so pick 'last'/'first' target only large images (skip avatars),
+    // which lets us grab the NEWEST generated image in a reused conversation via pick 'last'.
+    if (minWidth) nodes = nodes.filter(n => (n.naturalWidth || n.clientWidth || 0) >= minWidth);
     if (nodes.length === 0) return [];
     switch (pick) {
         case 'last': return [nodes[nodes.length - 1]];
@@ -49,7 +52,7 @@ function isDisabled(el) {
 }
 
 function handleCheck(step) {
-    const els = resolveElements(step.selector, step.pick || 'first', step.exclude_within);
+    const els = resolveElements(step.selector, step.pick || 'first', step.exclude_within, step.min_natural_width || 0);
     const el = els[0] || null;
     return {
         ok: true,
@@ -60,7 +63,8 @@ function handleCheck(step) {
         textLength: el ? (el.innerText || '').length : 0,
         textHash: el ? simpleHash(el.innerText || '') : null,
         naturalWidth: el ? (el.naturalWidth || 0) : 0,
-        naturalHeight: el ? (el.naturalHeight || 0) : 0
+        naturalHeight: el ? (el.naturalHeight || 0) : 0,
+        src: el ? (el.currentSrc || el.src || el.getAttribute('src') || '') : ''
     };
 }
 
@@ -216,9 +220,29 @@ function blobToDataURL(blob) {
 // src_url + a flag so interactionRunner.js re-fetches from the background service
 // worker (host_permissions bypass CORS there).
 async function handleExtractImage(step) {
-    const els = resolveElements(step.selector, step.pick || 'last', step.exclude_within);
-    const el = els.find(e => e.tagName === 'IMG') || els[0];
-    if (!el) return { ok: false, error: `extractImage: no element matches "${step.selector}"` };
+    // ChatGPT streams a generated image in progressively (a short-lived preview appears, then the
+    // final image replaces it ~60-90s later). Polling for the FIRST match grabs the preview, which
+    // is then gone by fetch time. So poll up to wait_ms for a matching IMG whose src has been
+    // STABLE for stable_ms — that's the finished image, not a transient preview.
+    const waitMs = step.wait_ms || 12000;
+    const stableMs = step.stable_ms || 0;
+    const minW = step.min_natural_width || 0;
+    const until = Date.now() + waitMs;
+    let el = null, lastSrc = null, stableSince = 0;
+    while (true) {
+        const els = resolveElements(step.selector, step.pick || 'last', step.exclude_within, minW);
+        const cand = els.find(e => e.tagName === 'IMG') || els[0] || null;
+        const src0 = cand && (cand.currentSrc || cand.src || cand.getAttribute('src'));
+        const bigEnough = !!(cand && src0 && (cand.naturalWidth || 0) >= minW);
+        if (bigEnough) {
+            if (src0 === lastSrc) {
+                if (!stableMs || (Date.now() - stableSince) >= stableMs) { el = cand; break; }
+            } else { lastSrc = src0; stableSince = Date.now(); }
+        } else { lastSrc = null; }
+        if (Date.now() >= until) { if (bigEnough) el = cand; break; }  // accept best candidate at timeout
+        await new Promise(r => setTimeout(r, 700));
+    }
+    if (!el) return { ok: false, error: `extractImage: no stable element matches "${step.selector}" (>=${minW}px) within ${waitMs}ms` };
     const src = el.currentSrc || el.src || el.getAttribute('src');
     if (!src) return { ok: false, error: 'extractImage: element has no src' };
 
@@ -333,17 +357,41 @@ function handleProbe(step) {
     }) } };
 }
 
+// Detect ChatGPT's rate-limit banners so we can back off instead of hammering the account (ban
+// risk). Only SPECIFIC ChatGPT phrases — no broad "rate limit"/"too many requests" that could
+// match incidental page text and false-trip a cooldown. Returns the matched text as evidence.
+const RATE_LIMIT_PATTERNS = [
+    /making requests too quickly/i,
+    /temporarily limited access to your conversations/i,
+    /you['’]?re sending messages too (fast|quickly)/i,
+    /please wait a few minutes before trying again/i,
+    /you['’]?ve reached (your|the).{0,25}(message|image|usage|plan) limit/i
+];
+function handleCheckRateLimit() {
+    const text = ((document.body && document.body.innerText) || '').slice(0, 8000);
+    for (const re of RATE_LIMIT_PATTERNS) {
+        const m = text.match(re);
+        if (m) {
+            const i = (m.index != null) ? m.index : text.indexOf(m[0]);
+            const snippet = text.slice(Math.max(0, i - 30), i + 140).replace(/\s+/g, ' ').trim();
+            return { ok: false, error: `CHATGPT_RATE_LIMITED: ${snippet}`, rate_limited: true, matched: re.source, snippet };
+        }
+    }
+    return { ok: true, rate_limited: false };
+}
+
 async function dispatchStep(step) {
     switch (step.action) {
-        case 'check':        return handleCheck(step);
-        case 'type':         return handleType(step);
-        case 'click':        return handleClick(step);
-        case 'press':        return handlePress(step);
-        case 'extract':      return handleExtract(step);
-        case 'extractImage': return await handleExtractImage(step);
-        case 'uploadFile':   return await handleUploadFile(step);
-        case 'probe':        return handleProbe(step);
-        default:             return { ok: false, error: `Unknown interaction action: ${step.action}` };
+        case 'check':          return handleCheck(step);
+        case 'type':           return handleType(step);
+        case 'click':          return handleClick(step);
+        case 'press':          return handlePress(step);
+        case 'extract':        return handleExtract(step);
+        case 'extractImage':   return await handleExtractImage(step);
+        case 'uploadFile':     return await handleUploadFile(step);
+        case 'probe':          return handleProbe(step);
+        case 'checkRateLimit': return handleCheckRateLimit();
+        default:               return { ok: false, error: `Unknown interaction action: ${step.action}` };
     }
 }
 

@@ -75,25 +75,40 @@ function remainingMs(deadline, index, step) {
     return left;
 }
 
-async function waitForState(tabId, step, index, deadline) {
+async function waitForState(tabId, step, index, deadline, baselineSrc = null) {
     const state = step.state || 'visible';
     const pollMs = step.poll_ms || 500;
     const timeoutMs = Math.min(step.timeout_ms || 30000, remainingMs(deadline, index, step));
     const until = Date.now() + timeoutMs;
+    let lastSrc = null, stableSince = 0;
 
     while (Date.now() < until) {
-        const res = await sendStep(tabId, { action: 'check', selector: step.selector, pick: step.pick });
+        // forward exclude_within + min_natural_width so the check honours the same filtering as the
+        // step (skip the user turn's reference image; size-filter so pick 'last' = newest big image).
+        const res = await sendStep(tabId, {
+            action: 'check', selector: step.selector, pick: step.pick,
+            exclude_within: step.exclude_within, min_natural_width: step.min_natural_width });
         // optional size gate: wait for an actually-large image (skip spinners/placeholders)
         const bigEnough = !step.min_natural_width || (res.naturalWidth || 0) >= step.min_natural_width;
         // optional count gate: wait until >= N elements match (e.g. N attachment previews)
         const countOk = !step.min_count || (res.count || 0) >= step.min_count;
-        const satisfied =
+        let satisfied =
             state === 'visible' ? (res.exists && res.visible && bigEnough && countOk) :
             state === 'hidden' ? (!res.exists || !res.visible) :
             state === 'attached' ? res.exists :
             state === 'detached' ? !res.exists :
             null;
         if (satisfied === null) throw new StepError(index, step, `unknown state "${state}"`);
+        // conversation reuse: require a NEW image (src differs from the one present before we sent),
+        // otherwise the wait matches the previous generation that's already on screen.
+        if (satisfied && step.src_change && res.src && res.src === baselineSrc) satisfied = false;
+        // optional stability gate: the matched src must hold steady for stable_ms (e.g. wait for a
+        // progressively-rendered generated image to settle, not a transient preview).
+        if (satisfied && step.stable_ms) {
+            if (res.src && res.src === lastSrc) {
+                if (Date.now() - stableSince < step.stable_ms) satisfied = false;
+            } else { lastSrc = res.src; stableSince = Date.now(); satisfied = false; }
+        }
         if (satisfied) return;
         await sleep(Math.min(pollMs, Math.max(50, until - Date.now())));
     }
@@ -194,8 +209,21 @@ export async function runInteractionTask(task, controlUrl, deps) {
     let tabId = null;
     let stepsExecuted = 0;
 
+    // Optional tab/conversation reuse (throttle optimisation): reuse a persistent tab if it's
+    // still open. 'conversation' also keeps the same chat (ref stays uploaded); 'warm' reuses the
+    // tab but starts a fresh chat. Falls back to a new tab if the persistent one is gone.
+    const reuseMode = params.reuse_mode || 'fresh';
+    let baselineSrc = null;
+    let reusing = false;
+    if (reuseMode !== 'fresh' && deps.getReuseTab) {
+        const rid = await deps.getReuseTab();
+        if (rid != null) {
+            try { await chrome.tabs.get(rid); tabId = rid; reusing = true; } catch (_) { /* tab gone -> new */ }
+        }
+    }
+
     runnerLogger.info('Starting interaction task', {
-        taskId: task.task_id, steps: steps.length, timeoutSec
+        taskId: task.task_id, steps: steps.length, timeoutSec, reuseMode, reusing
     });
 
     const heartbeat = startHeartbeat(controlUrl, task.task_id);
@@ -206,6 +234,18 @@ export async function runInteractionTask(task, controlUrl, deps) {
             remainingMs(deadline, i, step);
             runnerLogger.debug(`Step ${i}: ${step.action}`, { selector: step.selector });
 
+            // Conversation reuse: tab is already on the chat with the reference attached, so skip
+            // re-navigating and re-uploading. Capture the current newest-image src just before we
+            // send, so waitFor (src_change) can detect the NEW generation vs the previous one.
+            if (reusing && reuseMode === 'conversation') {
+                if (step.action === 'navigate' || step.action === 'uploadFile') { stepsExecuted++; continue; }
+                if (step.action === 'type' && baselineSrc === null) {
+                    const b = await sendStep(tabId, { action: 'check', selector: 'main img', pick: 'last',
+                        exclude_within: '[data-message-author-role="user"]', min_natural_width: 700 });
+                    baselineSrc = b.src || '';
+                }
+            }
+
             try {
                 switch (step.action) {
                     case 'navigate':
@@ -215,7 +255,7 @@ export async function runInteractionTask(task, controlUrl, deps) {
                         await sleep(Math.min(step.ms || 1000, remainingMs(deadline, i, step)));
                         break;
                     case 'waitFor':
-                        await waitForState(tabId, step, i, deadline);
+                        await waitForState(tabId, step, i, deadline, baselineSrc);
                         break;
                     case 'waitForStableText':
                         await waitForStableText(tabId, step, i, deadline);
@@ -225,7 +265,8 @@ export async function runInteractionTask(task, controlUrl, deps) {
                         break;
                     case 'type':
                     case 'press':
-                    case 'uploadFile': {
+                    case 'uploadFile':
+                    case 'checkRateLimit': {
                         const res = await sendStep(tabId, step);
                         if (!res.ok) throw new StepError(i, step, res.error);
                         break;
@@ -317,6 +358,16 @@ export async function runInteractionTask(task, controlUrl, deps) {
         runnerLogger.error('Interaction task failed', {
             taskId: task.task_id, error: error.message, stepsExecuted
         });
+        // On failure, optionally capture debug context so a single failed run is diagnosable
+        // (screenshot + DOM dump + rate-limit detection) instead of needing many probe runs.
+        let debug = null, rateLimited = /CHATGPT_RATE_LIMITED/.test(error.message || '');
+        if (params.debug_on_failure && tabId !== null) {
+            debug = {};
+            try { debug.screenshot = await new ScreenshotCapture().captureFullPage(tabId); } catch (_) {}
+            try { const p = await sendStep(tabId, { action: 'probe' }); debug.dom = p && p.data && p.data.text; } catch (_) {}
+            try { const r = await sendStep(tabId, { action: 'checkRateLimit' }); if (r && r.rate_limited) rateLimited = true; } catch (_) {}
+            debug.rate_limited = rateLimited;
+        }
         try {
             await submitResult(controlUrl, {
                 task_id: task.task_id,
@@ -328,7 +379,7 @@ export async function runInteractionTask(task, controlUrl, deps) {
                 error: error.message,
                 items: items,
                 summary: null,
-                metadata: { steps_executed: stepsExecuted }
+                metadata: { steps_executed: stepsExecuted, rate_limited: rateLimited, debug: debug }
             });
         } catch (submitError) {
             runnerLogger.error('Failed to submit failure result', {
@@ -338,7 +389,11 @@ export async function runInteractionTask(task, controlUrl, deps) {
         throw error;
     } finally {
         clearInterval(heartbeat);
-        if (tabId !== null && !params.keep_tab_open) {
+        // Reuse modes keep the tab alive for the next request; only fresh mode closes it.
+        if (reuseMode !== 'fresh' && tabId !== null && deps.setReuseTab) {
+            try { await deps.setReuseTab(tabId); } catch (_) { /* ignore */ }
+        }
+        if (tabId !== null && !params.keep_tab_open && reuseMode === 'fresh') {
             try {
                 await chrome.tabs.remove(tabId);
             } catch (closeError) {

@@ -265,7 +265,15 @@ async function processInteractionTask(task, controlUrl) {
     try {
         // Timeout/cleanup/result-reporting (incl. failure submission to /submit_task)
         // are handled inside runInteractionTask via its deadline.
-        await runInteractionTask(task, controlUrl, { waitForTabLoad, networkTracker });
+        // Reuse-tab id lives in storage.session so it survives service-worker restarts.
+        const getReuseTab = async () => {
+            try { const r = await chrome.storage.session.get('reuseTabId'); return (r && r.reuseTabId != null) ? r.reuseTabId : null; }
+            catch (_) { return null; }
+        };
+        const setReuseTab = async (tid) => {
+            try { await chrome.storage.session.set({ reuseTabId: tid }); } catch (_) { /* ignore */ }
+        };
+        await runInteractionTask(task, controlUrl, { waitForTabLoad, networkTracker, getReuseTab, setReuseTab });
         processLogger.info(`Interaction task ${processId} completed`, { taskId: task.task_id });
     } finally {
         await stateLock.setState('idle');
@@ -374,7 +382,9 @@ async function pollServer(controlUrl) {
     try {
         pollLogger.debug(`Poll ${pollId}: Fetching from server`);
         const extVersion = chrome.runtime.getManifest().version;
-        const response = await fetchWithTimeout(`${controlUrl}/get_url?v=${encodeURIComponent(extVersion)}&client=extension`, {}, 30000);
+        // 250s > server's 240s long-poll: hold one pending fetch continuously so the MV3 service
+        // worker stays alive (fast task pickup) instead of dying and waiting for the 30s alarm.
+        const response = await fetchWithTimeout(`${controlUrl}/get_url?v=${encodeURIComponent(extVersion)}&client=extension`, {}, 250000);
         
         pollLogger.debug(`Poll ${pollId}: Response received`, { 
             status: response.status,
