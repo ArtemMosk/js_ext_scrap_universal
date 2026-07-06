@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Universal Web Scraper",
-  "version": "1.2.8",
-  "version_name": "1.2.8 \u2014 long-hold poll keeps MV3 worker warm (fast task pickup)",
+  "version": "1.3.8",
+  "version_name": "1.3.8 \u2014 observability contract: evidence envelope, ordered failure capture, frame caps, debug caps advertised",
   "permissions": [
     "alarms",
     "scripting",

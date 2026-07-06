@@ -4,7 +4,7 @@ import Logger from './logger.js';
 import NetworkRequestTracker from './networkRequestTracker.js';
 import ScreenshotCapture from './backgroundScreenshotHandler.js';
 import { StateLock } from './stateLock.js';
-import { runInteractionTask } from './interactionRunner.js';
+import { runInteractionTask, authHeaders } from './interactionRunner.js';
 
 // Loggers for different components
 const logger = new Logger();
@@ -44,7 +44,9 @@ const defaultSettings = {
 // Auto-start: when no controlUrl is stored, poll this server on load. Lets the
 // extension work in a browser we can't configure post-launch (default-profile
 // Chrome blocks remote debugging). Empty string = disabled (normal behaviour).
-const AUTOSTART_CONTROL_URL = 'http://100.107.180.35:8010';
+const AUTOSTART_CONTROL_URL = '';  // no infra hardcode: configure via popup (C4)
+// Advertised on every poll; the server's capability gate only hands us jobs we can run.
+const EXT_CAPABILITIES = 'uploadFile,extractImage,detectTextPatterns,clickTextMatch,awaitResult,debugWatch,windowState,pageReload';
 
 // Direct status setter without logging
 function setStatus(status) {
@@ -85,6 +87,53 @@ async function fetchWithTimeout(url, options = {}, timeout = 5000) {
     } finally {
         clearTimeout(timeoutId);
     }
+}
+
+async function acknowledgeExtensionControl(controlUrl, command, status, message = null) {
+    try {
+        await fetch(`${controlUrl}/extension/control_ack`, {
+            method: 'POST',
+            headers: await authHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({
+                command_id: command.id || null,
+                action: command.action,
+                status,
+                version: chrome.runtime.getManifest().version,
+                message
+            })
+        });
+    } catch (error) {
+        pollLogger.warn('Failed to acknowledge extension control command', {
+            action: command.action,
+            commandId: command.id,
+            error: error.message
+        });
+    }
+}
+
+async function handleExtensionControlCommand(payload, controlUrl) {
+    const command = payload.command || payload;
+    if (!command || command.action !== 'reload') {
+        pollLogger.warn('Unknown extension control command', { payload });
+        return true;
+    }
+
+    pollLogger.warn('Extension reload requested by control server', {
+        commandId: command.id,
+        reason: command.reason,
+        createdAt: command.created_at
+    });
+
+    setStatus('Reloading extension');
+    isContinuousPolling = false;
+    await saveState();
+    await acknowledgeExtensionControl(controlUrl, command, 'reloading');
+
+    setTimeout(() => {
+        chrome.runtime.reload();
+    }, 100);
+
+    return true;
 }
 
 async function processUrl(url, controlUrl, captureScreenshot = true) {
@@ -168,9 +217,7 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
 
                     const response = await fetch(controlUrl + '/submit', {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
+                        headers: await authHeaders({ 'Content-Type': 'application/json' }),
                         body: JSON.stringify(contentData)
                     });
 
@@ -206,7 +253,7 @@ async function processUrl(url, controlUrl, captureScreenshot = true) {
         try {
             await fetch(controlUrl + '/report_error', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: await authHeaders({ 'Content-Type': 'application/json' }),
                 body: JSON.stringify({
                     url: url,
                     error: error.message,
@@ -265,13 +312,18 @@ async function processInteractionTask(task, controlUrl) {
     try {
         // Timeout/cleanup/result-reporting (incl. failure submission to /submit_task)
         // are handled inside runInteractionTask via its deadline.
-        // Reuse-tab id lives in storage.session so it survives service-worker restarts.
+        // Reuse-tab id + its context live in storage.session so they survive SW restarts. The
+        // context (reuse scope + reference set, set by the server) lets the runner skip
+        // navigate+upload ONLY when the stored tab genuinely matches this task (B3).
         const getReuseTab = async () => {
-            try { const r = await chrome.storage.session.get('reuseTabId'); return (r && r.reuseTabId != null) ? r.reuseTabId : null; }
-            catch (_) { return null; }
+            try {
+                const r = await chrome.storage.session.get(['reuseTabId', 'reuseContext']);
+                return (r && r.reuseTabId != null) ? { id: r.reuseTabId, context: r.reuseContext || '' } : null;
+            } catch (_) { return null; }
         };
-        const setReuseTab = async (tid) => {
-            try { await chrome.storage.session.set({ reuseTabId: tid }); } catch (_) { /* ignore */ }
+        const setReuseTab = async (tid, context) => {
+            try { await chrome.storage.session.set({ reuseTabId: tid, reuseContext: context || '' }); }
+            catch (_) { /* ignore */ }
         };
         await runInteractionTask(task, controlUrl, { waitForTabLoad, networkTracker, getReuseTab, setReuseTab });
         processLogger.info(`Interaction task ${processId} completed`, { taskId: task.task_id });
@@ -384,7 +436,7 @@ async function pollServer(controlUrl) {
         const extVersion = chrome.runtime.getManifest().version;
         // 250s > server's 240s long-poll: hold one pending fetch continuously so the MV3 service
         // worker stays alive (fast task pickup) instead of dying and waiting for the 30s alarm.
-        const response = await fetchWithTimeout(`${controlUrl}/get_url?v=${encodeURIComponent(extVersion)}&client=extension`, {}, 250000);
+        const response = await fetchWithTimeout(`${controlUrl}/get_url?v=${encodeURIComponent(extVersion)}&caps=${encodeURIComponent(EXT_CAPABILITIES)}&client=extension`, { headers: await authHeaders() }, 250000);
         
         pollLogger.debug(`Poll ${pollId}: Response received`, { 
             status: response.status,
@@ -401,7 +453,15 @@ async function pollServer(controlUrl) {
         }
 
         const data = await response.json();
-        pollLogger.info(`Poll ${pollId}: Received URL`, { url: data.url });
+        pollLogger.info(`Poll ${pollId}: Received payload`, {
+            type: data.type || 'url',
+            url: data.url,
+            action: data.command?.action || data.action
+        });
+
+        if (data.type === 'extension_control') {
+            return await handleExtensionControlCommand(data, controlUrl);
+        }
 
         if (data.type === 'interaction_task' && data.task) {
             setStatus(`Processing interaction task: ${data.task.task_id}`);
@@ -437,7 +497,7 @@ async function pollServer(controlUrl) {
                 try {
                     const response = await fetch(controlUrl + '/report_error', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: await authHeaders({ 'Content-Type': 'application/json' }),
                         body: JSON.stringify({
                             url: data.url,
                             error: processError.message,

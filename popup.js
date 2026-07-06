@@ -1,9 +1,12 @@
 // popup.js
 document.addEventListener('DOMContentLoaded', async () => {
     // Load saved settings from sync storage
-    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
+    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval', 'apiToken']);
     if (settings.controlUrl) {
         document.getElementById('control-url').value = settings.controlUrl;
+    }
+    if (settings.apiToken) {
+        document.getElementById('api-token').value = settings.apiToken;
     }
     if (settings.pollInterval) {
         document.getElementById('poll-interval').value = settings.pollInterval;
@@ -95,9 +98,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 return;
             }
 
+            const apiToken = document.getElementById('api-token').value.trim();
             await chrome.storage.sync.set({
                 controlUrl,
-                pollInterval
+                pollInterval,
+                apiToken
             });
 
             document.getElementById('status').textContent = 'Settings saved successfully';
@@ -110,6 +115,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('start-polling').addEventListener('click', async () => {
         const controlUrl = document.getElementById('control-url').value;
         const pollInterval = parseInt(document.getElementById('poll-interval').value);
+        const apiToken = document.getElementById('api-token').value.trim();
 
         if (!controlUrl) {
             document.getElementById('status').textContent = 'Error: Please enter a control server URL';
@@ -121,10 +127,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        // Save settings before starting
+        // Persist settings before starting — INCLUDING the API token, or an authed server 401s
+        // every poll (the token field is read from storage.sync by authHeaders on each request).
         await chrome.storage.sync.set({
             controlUrl,
-            pollInterval
+            pollInterval,
+            apiToken
         });
 
         chrome.runtime.sendMessage({ 
@@ -165,6 +173,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             await chrome.storage.sync.clear();
             document.getElementById('control-url').value = '';
             document.getElementById('poll-interval').value = '30';
+            document.getElementById('api-token').value = '';
             document.getElementById('status').textContent = 'Status: Settings cleared';
         } catch (error) {
             document.getElementById('status').textContent = `Error clearing settings: ${error.message}`;

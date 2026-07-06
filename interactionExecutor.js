@@ -22,11 +22,18 @@ function elementArea(el) {
     return w * h;
 }
 
-function resolveElements(selector, pick = 'first', excludeWithin = null, minWidth = 0) {
+function resolveElements(selector, pick = 'first', excludeWithin = null, minWidth = 0, textMatch = null) {
     let nodes = Array.from(document.querySelectorAll(selector));
-    // Drop elements inside an excluded ancestor (e.g. the ChatGPT user turn, so an
+    // Drop elements inside an excluded ancestor (e.g. a chat UI's user message turn, so an
     // uploaded reference image is never mistaken for the generated image).
     if (excludeWithin) nodes = nodes.filter(n => !n.closest(excludeWithin));
+    // Optional text filter (CSS can't select by text): pick buttons/links by their visible
+    // label, e.g. {selector: "button", text_match: "^Retry$"} — labels arrive as server data.
+    if (textMatch) {
+        let re;
+        try { re = new RegExp(textMatch, 'i'); } catch (_) { return []; }
+        nodes = nodes.filter(n => re.test(((n.innerText || n.textContent) || '').trim()));
+    }
     // Optional size filter so pick 'last'/'first' target only large images (skip avatars),
     // which lets us grab the NEWEST generated image in a reused conversation via pick 'last'.
     if (minWidth) nodes = nodes.filter(n => (n.naturalWidth || n.clientWidth || 0) >= minWidth);
@@ -54,6 +61,20 @@ function isDisabled(el) {
 function handleCheck(step) {
     const els = resolveElements(step.selector, step.pick || 'first', step.exclude_within, step.min_natural_width || 0);
     const el = els[0] || null;
+    // Diagnostic geometry so we can distinguish decode-throttle (in view but naturalWidth 0)
+    // from lazy-load-out-of-view (below the fold). scroll_into_view forces the element into the
+    // viewport first — if it then decodes, that's the lazy mechanism.
+    if (el && step.scroll_into_view) { try { el.scrollIntoView({ block: 'center' }); } catch (_) {} }
+    let rect = null, inViewport = null, loadingAttr = null, complete = null;
+    if (el && el.getBoundingClientRect) {
+        const r = el.getBoundingClientRect();
+        rect = { top: Math.round(r.top), bottom: Math.round(r.bottom),
+                 height: Math.round(r.height), width: Math.round(r.width) };
+        inViewport = r.bottom > 0 && r.top < (window.innerHeight || 0)
+                     && r.right > 0 && r.left < (window.innerWidth || 0);
+        loadingAttr = el.getAttribute ? el.getAttribute('loading') : null;
+        complete = ('complete' in el) ? el.complete : null;
+    }
     return {
         ok: true,
         exists: !!el,
@@ -64,7 +85,10 @@ function handleCheck(step) {
         textHash: el ? simpleHash(el.innerText || '') : null,
         naturalWidth: el ? (el.naturalWidth || 0) : 0,
         naturalHeight: el ? (el.naturalHeight || 0) : 0,
-        src: el ? (el.currentSrc || el.src || el.getAttribute('src') || '') : ''
+        src: el ? (el.currentSrc || el.src || el.getAttribute('src') || '') : '',
+        rect, inViewport, loading: loadingAttr, complete,
+        innerHeight: window.innerHeight || 0, scrollY: Math.round(window.scrollY || 0),
+        docVisibility: document.visibilityState
     };
 }
 
@@ -135,7 +159,7 @@ function handleType(step) {
 }
 
 function handleClick(step) {
-    const els = resolveElements(step.selector, step.pick || 'first');
+    const els = resolveElements(step.selector, step.pick || 'first', step.exclude_within, 0, step.text_match);
     const el = els[0];
     if (!el) return { ok: false, error: `click: no element matches "${step.selector}"`, missing: true };
     if (isDisabled(el)) return { ok: false, disabled: true, error: 'click: element is disabled' };
@@ -215,12 +239,12 @@ function blobToDataURL(blob) {
 }
 
 // Extract a rendered image's actual bytes as a base64 data URL.
-// Primary path: fetch in the page context (same-origin / CORS-ok — e.g. ChatGPT's
+// Primary path: fetch in the page context (same-origin / CORS-ok — e.g. a chat site's
 // generated images, verified to work). On a cross-origin/CORS failure, return
 // src_url + a flag so interactionRunner.js re-fetches from the background service
 // worker (host_permissions bypass CORS there).
 async function handleExtractImage(step) {
-    // ChatGPT streams a generated image in progressively (a short-lived preview appears, then the
+    // Chat sites stream a generated image in progressively (a short-lived preview appears, then the
     // final image replaces it ~60-90s later). Polling for the FIRST match grabs the preview, which
     // is then gone by fetch time. So poll up to wait_ms for a matching IMG whose src has been
     // STABLE for stable_ms — that's the finished image, not a transient preview.
@@ -284,7 +308,7 @@ function dataUrlToFile(dataUrl, name) {
 }
 
 // Count independent signals that an attachment actually rendered in the composer.
-// Multi-signal so we don't depend on one fragile ChatGPT class/testid.
+// Multi-signal so we don't depend on one fragile site class/testid.
 function attachmentSignals(baselineBlobImgs) {
     return {
         blobImgsDelta: document.querySelectorAll('img[src^="blob:"]').length - baselineBlobImgs,
@@ -338,7 +362,7 @@ async function handleUploadFile(step) {
 }
 
 // Diagnostic: dump the page's images (size, src scheme/head, which turn) + composer state.
-// Returned as JSON text so the server/caller can see ChatGPT's real DOM without CDP.
+// Returned as JSON text so the server/caller can see the page's real DOM without CDP.
 function handleProbe(step) {
     const imgs = Array.from(document.querySelectorAll('img')).map(i => ({
         w: i.naturalWidth, h: i.naturalHeight,
@@ -357,27 +381,35 @@ function handleProbe(step) {
     }) } };
 }
 
-// Detect ChatGPT's rate-limit banners so we can back off instead of hammering the account (ban
-// risk). Only SPECIFIC ChatGPT phrases — no broad "rate limit"/"too many requests" that could
-// match incidental page text and false-trip a cooldown. Returns the matched text as evidence.
-const RATE_LIMIT_PATTERNS = [
-    /making requests too quickly/i,
-    /temporarily limited access to your conversations/i,
-    /you['’]?re sending messages too (fast|quickly)/i,
-    /please wait a few minutes before trying again/i,
-    /you['’]?ve reached (your|the).{0,25}(message|image|usage|plan) limit/i
-];
-function handleCheckRateLimit() {
+// Generic page-text pattern detection. The PATTERNS ARRIVE AS STEP DATA from the server-side
+// product adapter, keeping the extension site-blind after the former hardcoded
+// checkRateLimit moved to chatgpt-browser-api. Keep patterns
+// SPECIFIC server-side — broad ones could match incidental page text and false-trip cooldowns.
+// step: { patterns: ["regex", ...], flags?: "i", label?: "rate_limit",
+//         fail_on_match?: true }  — fail_on_match:false = probe mode (report, don't fail).
+function handleDetectTextPatterns(step) {
+    const patterns = Array.isArray(step.patterns) ? step.patterns : [];
+    if (!patterns.length) return { ok: false, error: 'detectTextPatterns: no patterns supplied' };
+    const label = step.label || 'pattern';
+    const flags = step.flags !== undefined ? step.flags : 'i';
     const text = ((document.body && document.body.innerText) || '').slice(0, 8000);
-    for (const re of RATE_LIMIT_PATTERNS) {
+    for (const source of patterns) {
+        let re;
+        try { re = new RegExp(source, flags); } catch (e) {
+            return { ok: false, error: `detectTextPatterns: bad pattern ${source}: ${e.message}` };
+        }
         const m = text.match(re);
         if (m) {
             const i = (m.index != null) ? m.index : text.indexOf(m[0]);
             const snippet = text.slice(Math.max(0, i - 30), i + 140).replace(/\s+/g, ' ').trim();
-            return { ok: false, error: `CHATGPT_RATE_LIMITED: ${snippet}`, rate_limited: true, matched: re.source, snippet };
+            if (step.fail_on_match === false) {
+                return { ok: true, pattern_detected: label, matched: source, snippet };
+            }
+            return { ok: false, error: `PATTERN_DETECTED[${label}]: ${snippet}`,
+                     pattern_detected: label, matched: source, snippet };
         }
     }
-    return { ok: true, rate_limited: false };
+    return { ok: true, pattern_detected: null };
 }
 
 async function dispatchStep(step) {
@@ -390,7 +422,7 @@ async function dispatchStep(step) {
         case 'extractImage':   return await handleExtractImage(step);
         case 'uploadFile':     return await handleUploadFile(step);
         case 'probe':          return handleProbe(step);
-        case 'checkRateLimit': return handleCheckRateLimit();
+        case 'detectTextPatterns': return handleDetectTextPatterns(step);
         default:               return { ok: false, error: `Unknown interaction action: ${step.action}` };
     }
 }
