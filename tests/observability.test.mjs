@@ -160,3 +160,55 @@ test('failure evidence screenshot timeout still submits DOM evidence', async () 
                  /Screenshot capture timed out after 10ms/);
     assert.equal(submitted.metadata.evidence.failure.dom, '{"dom":true}');
 });
+
+test('failure evidence probe timeout still submits failed result', async () => {
+    let submitted = null;
+
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).endsWith('/submit_task')) {
+            submitted = JSON.parse(options.body).result;
+        }
+        return { ok: true, status: 200, text: async () => '' };
+    };
+
+    chrome.tabs.sendMessage = async (_tabId, message, callback) => {
+        if (message && message.action === 'takeScreenshot') {
+            callback({ images: [] });
+            return;
+        }
+        const step = message.step || {};
+        if (step.action === 'type') {
+            return { ok: false, error: 'type: no element matches "#never"' };
+        }
+        if (step.action === 'probe') {
+            return new Promise(() => {});
+        }
+        return { ok: true, exists: true, visible: true, count: 1, naturalWidth: 0, src: '' };
+    };
+
+    await assert.rejects(
+        runInteractionTask({
+            task_id: 'obs-fail-probe-timeout',
+            task_type: 'browser_interaction',
+            params: {
+                debug_on_failure: true,
+                debug_step_timeout_ms: 10,
+                timeout_sec: 5,
+                steps: [
+                    { action: 'navigate', url: 'http://127.0.0.1/test_page' },
+                    { action: 'type', selector: '#never', text: 'x' }
+                ]
+            }
+        }, 'http://core.test', {
+            waitForTabLoad: async () => {},
+            networkTracker: { setTargetUrl: () => {} }
+        }),
+        /no element matches/
+    );
+
+    assert.equal(submitted.status, 'failed');
+    assert.match(
+        submitted.metadata.evidence.failure.capture_errors.join('\n'),
+        /probe response timed out after 50ms/
+    );
+});

@@ -12,7 +12,10 @@ const runnerLogger = new Logger('INTERACT');
 const DEFAULT_TASK_TIMEOUT_SEC = 240;
 const MAX_TASK_TIMEOUT_SEC = 480; // matches the 8-minute processing ceiling in processUrl
 const HEARTBEAT_INTERVAL_MS = 30000;
+const CONTENT_STEP_TIMEOUT_MS = 15000;
+const MAX_CONTENT_STEP_TIMEOUT_MS = 60000;
 const FAILURE_SCREENSHOT_TIMEOUT_MS = 8000;
+const FAILURE_STEP_TIMEOUT_MS = 3000;
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -45,10 +48,49 @@ class StepError extends Error {
     }
 }
 
-async function sendStep(tabId, step) {
+function boundedTimeoutMs(value, fallback, max = MAX_CONTENT_STEP_TIMEOUT_MS) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.max(50, Math.min(max, n));
+}
+
+function responseTimeoutMs(step, overrideMs) {
+    if (overrideMs !== undefined) return boundedTimeoutMs(overrideMs, CONTENT_STEP_TIMEOUT_MS);
+    if (step && step.response_timeout_ms !== undefined) {
+        return boundedTimeoutMs(step.response_timeout_ms, CONTENT_STEP_TIMEOUT_MS);
+    }
+    if (step && step.action === 'uploadFile') {
+        return boundedTimeoutMs((step.verify_timeout_ms || 15000) + 5000, 20000);
+    }
+    return CONTENT_STEP_TIMEOUT_MS;
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+    let timeoutId = null;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(
+                    () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+                    timeoutMs
+                );
+            })
+        ]);
+    } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+    }
+}
+
+async function sendStep(tabId, step, timeoutMs) {
+    const limitMs = responseTimeoutMs(step, timeoutMs);
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            return await chrome.tabs.sendMessage(tabId, { type: 'interaction_step', step });
+            return await withTimeout(
+                chrome.tabs.sendMessage(tabId, { type: 'interaction_step', step }),
+                limitMs,
+                `${step.action || 'interaction step'} response`
+            );
         } catch (error) {
             // Content script not there yet (slow SPA boot, navigation race) - inject and retry
             if (error.message && error.message.includes('Receiving end does not exist') && attempt < 3) {
@@ -648,7 +690,7 @@ export async function runInteractionTask(task, controlUrl, deps) {
                 const detectStep = (steps || []).find(
                     s => s.action === 'detectTextPatterns' && (s.label || 'pattern') === 'rate_limit');
                 if (detectStep) {
-                    const r = await sendStep(tabId, { ...detectStep, fail_on_match: false });
+                    const r = await sendStep(tabId, { ...detectStep, fail_on_match: false }, FAILURE_STEP_TIMEOUT_MS);
                     if (r && r.pattern_detected) rateLimited = true;
                 }
             } catch (_) {}
@@ -662,12 +704,20 @@ export async function runInteractionTask(task, controlUrl, deps) {
                 Math.max(1, Number(params.debug_screenshot_timeout_ms) || FAILURE_SCREENSHOT_TIMEOUT_MS),
                 FAILURE_SCREENSHOT_TIMEOUT_MS
             );
+            const failureStepTimeoutMs = boundedTimeoutMs(
+                params.debug_step_timeout_ms,
+                FAILURE_STEP_TIMEOUT_MS,
+                15000
+            );
             try {
                 failure.screenshot = await new ScreenshotCapture().captureFullPage(
                     tabId, { timeoutMs: screenshotTimeoutMs });
             }
             catch (e) { failure.capture_errors.push(`screenshot: ${e.message}`); }
-            try { const p = await sendStep(tabId, { action: 'probe' }); failure.dom = p && p.data && p.data.text; }
+            try {
+                const p = await sendStep(tabId, { action: 'probe' }, failureStepTimeoutMs);
+                failure.dom = p && p.data && p.data.text;
+            }
             catch (e) { failure.capture_errors.push(`probe: ${e.message}`); }
             evidence.failure = failure;
             debug = { rate_limited: rateLimited, screenshot: failure.screenshot, dom: failure.dom };
@@ -675,14 +725,19 @@ export async function runInteractionTask(task, controlUrl, deps) {
         // 3. FM3 cancel-on-abandon: the site runs ONE generation job per account — a job we
         // abandon must be stopped, or it silently blocks every later request. Best-effort.
         if (tabId !== null && params.cancel_selector) {
+            const failureStepTimeoutMs = boundedTimeoutMs(
+                params.debug_step_timeout_ms,
+                FAILURE_STEP_TIMEOUT_MS,
+                15000
+            );
             try {
-                await sendStep(tabId, { action: 'click', selector: params.cancel_selector });
+                await sendStep(tabId, { action: 'click', selector: params.cancel_selector }, failureStepTimeoutMs);
                 runnerLogger.warn('cancel-on-abandon: stop control clicked', { taskId: task.task_id });
             } catch (_) { /* best effort */ }
             // 4. Post-cancel state, marked separately (never overwrites the failure evidence).
             if (params.debug_on_failure) {
                 try {
-                    const p = await sendStep(tabId, { action: 'probe' });
+                    const p = await sendStep(tabId, { action: 'probe' }, failureStepTimeoutMs);
                     evidence.post_cancel = { dom: p && p.data && p.data.text, capture_errors: [] };
                 } catch (e) { evidence.post_cancel = { capture_errors: [`probe: ${e.message}`] }; }
             }

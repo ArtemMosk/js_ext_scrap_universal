@@ -3,6 +3,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "takeScreenshot") {
         console.log('[SCREENSHOT] Starting screenshot capture for:', window.location.href);
         const captureStartTime = Date.now();
+        const requestedTimeout = Number.isFinite(Number(request.timeoutMs))
+            ? Math.max(50, Number(request.timeoutMs))
+            : 30000;
         
         const { scrollHeight, clientHeight } = document.documentElement;
         const devicePixelRatio = window.devicePixelRatio || 1;
@@ -23,13 +26,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         
         // Set reasonable limits
         const MAX_SCREENSHOTS = 10; // Limit to 10 screenshots max
-        const CAPTURE_TIMEOUT = 30000; // 30 seconds total timeout
+        const CAPTURE_TIMEOUT = Math.min(30000, requestedTimeout); // total timeout
         const MAX_PAGE_HEIGHT = clientHeight * 15; // Max 15 viewports
+        let settled = false;
+
+        const settle = (payload) => {
+            if (settled) return true;
+            settled = true;
+            clearTimeout(timeoutId);
+            sendResponse(payload);
+            return true;
+        };
+
+        const remainingMs = () => Math.max(0, CAPTURE_TIMEOUT - (Date.now() - captureStartTime));
         
         // Set overall timeout
         const timeoutId = setTimeout(() => {
             console.error('[SCREENSHOT] Total capture timeout after', CAPTURE_TIMEOUT, 'ms');
-            sendResponse({ 
+            settle({
                 images: capturedImages,
                 error: 'CAPTURE_TIMEOUT',
                 debug: {
@@ -42,19 +56,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const captureAndScroll = async () => {
             const scrollAmount = clientHeight;
             try {
+                if (settled) return;
+                if (remainingMs() <= 0) {
+                    settle({
+                        images: capturedImages,
+                        error: 'CAPTURE_TIMEOUT',
+                        debug: {
+                            capturedCount: captureCount,
+                            timeElapsed: Date.now() - captureStartTime
+                        }
+                    });
+                    return;
+                }
+
                 // Check capture limits
                 if (captureCount >= MAX_SCREENSHOTS) {
                     console.warn('[SCREENSHOT] Reached max screenshot limit:', MAX_SCREENSHOTS);
-                    clearTimeout(timeoutId);
-                    sendResponse({ images: capturedImages });
+                    settle({ images: capturedImages });
                     return;
                 }
                 
                 // Check if we've captured enough for very tall pages
                 if (capturedHeight >= MAX_PAGE_HEIGHT) {
                     console.warn('[SCREENSHOT] Reached max page height limit:', MAX_PAGE_HEIGHT);
-                    clearTimeout(timeoutId);
-                    sendResponse({ images: capturedImages });
+                    settle({ images: capturedImages });
                     return;
                 }
                 
@@ -64,7 +89,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 console.log('[SCREENSHOT] Capture', captureCount + 1, '- Height:', capturedHeight, '/', scrollHeight);
                 
                 // Always capture the current view with individual timeout
-                const captureTimeout = 5000; // 5 seconds per capture
+                const captureTimeout = Math.max(100, Math.min(5000, remainingMs())); // 5 seconds per capture
                 const dataUrl = await Promise.race([
                     new Promise((resolve, reject) => {
                         chrome.runtime.sendMessage({ 
@@ -93,8 +118,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     // If this was the last capture, send response immediately
                     if (isLastCapture) {
                         console.log('[SCREENSHOT] Reached end of page, total captures:', captureCount);
-                        clearTimeout(timeoutId);
-                        sendResponse({ 
+                        settle({
                             images: capturedImages,
                             debug: {
                                 totalCaptures: captureCount,
@@ -114,8 +138,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     const newScrollHeight = document.documentElement.scrollHeight;
                     if (newScrollHeight > scrollHeight * 1.5) {
                         console.warn('[SCREENSHOT] Page height increased significantly, possible infinite scroll');
-                        clearTimeout(timeoutId);
-                        sendResponse({ 
+                        settle({
                             images: capturedImages,
                             warning: 'INFINITE_SCROLL_DETECTED'
                         });
@@ -128,8 +151,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 }
             } catch (error) {
                 console.error('[SCREENSHOT] Capture failed:', error);
-                clearTimeout(timeoutId);
-                sendResponse({ 
+                settle({
                     images: capturedImages,
                     error: error.message,
                     debug: {
@@ -156,8 +178,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Start capturing and scrolling
         captureAndScroll().catch(error => {
             console.error('[SCREENSHOT] Unexpected error in captureAndScroll:', error);
-            clearTimeout(timeoutId);
-            sendResponse({ 
+            settle({
                 images: capturedImages || [],
                 error: 'UNEXPECTED_ERROR: ' + error.message
             });

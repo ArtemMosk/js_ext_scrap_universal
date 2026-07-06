@@ -36,7 +36,10 @@ export default class ScreenshotCapture {
         let timeoutId = null;
         try {
             const capture = new Promise((resolve, reject) => {
-                chrome.tabs.sendMessage(tabId, { action: "takeScreenshot" }, async (response) => {
+                chrome.tabs.sendMessage(
+                    tabId,
+                    { action: "takeScreenshot", timeoutMs },
+                    async (response) => {
                     if (chrome.runtime.lastError) {
                         this.logger.error('Screenshot capture failed', { 
                             error: chrome.runtime.lastError 
@@ -46,7 +49,10 @@ export default class ScreenshotCapture {
                     }
 
                     try {
-                        const { images } = response;
+                        if (response && response.error && (!response.images || response.images.length === 0)) {
+                            throw new Error(response.error);
+                        }
+                        const { images } = response || {};
                         if (!images || images.length === 0) {
                             throw new Error('No images captured');
                         }
