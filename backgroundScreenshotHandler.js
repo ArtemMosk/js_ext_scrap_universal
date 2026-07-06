@@ -29,9 +29,13 @@ export default class ScreenshotCapture {
         });
     }
 
-    async captureFullPage(tabId) {
+    async captureFullPage(tabId, options = {}) {
+        const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+            ? Math.max(1, Number(options.timeoutMs))
+            : 35000;
+        let timeoutId = null;
         try {
-            return new Promise((resolve, reject) => {
+            const capture = new Promise((resolve, reject) => {
                 chrome.tabs.sendMessage(tabId, { action: "takeScreenshot" }, async (response) => {
                     if (chrome.runtime.lastError) {
                         this.logger.error('Screenshot capture failed', { 
@@ -83,12 +87,20 @@ export default class ScreenshotCapture {
                     }
                 });
             });
+            const timeout = new Promise((_, reject) => {
+                timeoutId = setTimeout(() => {
+                    reject(new Error(`Screenshot capture timed out after ${timeoutMs}ms`));
+                }, timeoutMs);
+            });
+            return await Promise.race([capture, timeout]);
         } catch (error) {
             this.logger.error(`Failed to capture full page screenshot for tab ${tabId}`, {
                 error: error.message,
                 stack: error.stack
             });
             throw error;
+        } finally {
+            if (timeoutId !== null) clearTimeout(timeoutId);
         }
     }
-} 
+}

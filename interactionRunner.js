@@ -12,6 +12,7 @@ const runnerLogger = new Logger('INTERACT');
 const DEFAULT_TASK_TIMEOUT_SEC = 240;
 const MAX_TASK_TIMEOUT_SEC = 480; // matches the 8-minute processing ceiling in processUrl
 const HEARTBEAT_INTERVAL_MS = 30000;
+const FAILURE_SCREENSHOT_TIMEOUT_MS = 8000;
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -657,7 +658,14 @@ export async function runInteractionTask(task, controlUrl, deps) {
         let debug = null;
         if (params.debug_on_failure && tabId !== null) {
             const failure = { capture_errors: [] };
-            try { failure.screenshot = await new ScreenshotCapture().captureFullPage(tabId); }
+            const screenshotTimeoutMs = Math.min(
+                Math.max(1, Number(params.debug_screenshot_timeout_ms) || FAILURE_SCREENSHOT_TIMEOUT_MS),
+                FAILURE_SCREENSHOT_TIMEOUT_MS
+            );
+            try {
+                failure.screenshot = await new ScreenshotCapture().captureFullPage(
+                    tabId, { timeoutMs: screenshotTimeoutMs });
+            }
             catch (e) { failure.capture_errors.push(`screenshot: ${e.message}`); }
             try { const p = await sendStep(tabId, { action: 'probe' }); failure.dom = p && p.data && p.data.text; }
             catch (e) { failure.capture_errors.push(`probe: ${e.message}`); }

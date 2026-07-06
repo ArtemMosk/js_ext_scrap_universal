@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Universal Web Scraper",
-  "version": "1.3.8",
-  "version_name": "1.3.8 \u2014 observability contract: evidence envelope, ordered failure capture, frame caps, debug caps advertised",
+  "version": "1.3.9",
+  "version_name": "1.3.9 \u2014 observability hotfix: bounded failure screenshots, evidence still submits on capture stalls",
   "permissions": [
     "alarms",
     "scripting",
