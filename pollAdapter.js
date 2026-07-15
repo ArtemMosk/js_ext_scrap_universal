@@ -46,6 +46,9 @@ export function makePollOnce({
                 'protocol',
             );
         }
+        // The transport may complete at the same time as Stop/Clear/reconfigure. Fence dispatch at the
+        // last synchronous boundary so a payload owned by an aborted generation cannot start work.
+        if (signal?.aborted) { throw externalAbortError(); }
         try {
             await dispatch(result.data, controlUrl);
         } catch (error) {
@@ -53,4 +56,11 @@ export function makePollOnce({
         }
         return true;
     };
+}
+
+function externalAbortError() {
+    const error = new Error('poll aborted by controller before dispatch');
+    error.name = 'AbortError';
+    error.reason = 'external';
+    return error;
 }

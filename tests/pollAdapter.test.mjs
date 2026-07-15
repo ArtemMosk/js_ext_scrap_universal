@@ -44,6 +44,26 @@ test('payload → dispatch is called then pollOnce returns true', async () => {
     assert.deepEqual(dispatched, { url: 'x' });
 });
 
+test('aborted generation cannot dispatch a payload that completed late', async () => {
+    const controller = new AbortController();
+    let dispatchCalls = 0;
+    const pollOnce = makePollOnce({
+        authHeaders,
+        timeoutMs: 100,
+        dispatch: async () => { dispatchCalls += 1; },
+        pollGetUrlImpl: async () => {
+            controller.abort();
+            return { type: 'payload', data: { url: 'stale' } };
+        },
+    });
+
+    await assert.rejects(
+        pollOnce('http://old-control', { signal: controller.signal }),
+        (error) => error.name === 'AbortError' && error.reason === 'external',
+    );
+    assert.equal(dispatchCalls, 0, 'stale payload must not cross the dispatch boundary');
+});
+
 test('dispatch failure is classified at the adapter boundary', async () => {
     const pollOnce = makePollOnce({
         authHeaders,

@@ -32,7 +32,7 @@ export function withPollCategory(error, pollCategory) {
 //   authHeaders  — async () => headers; injected (prod: interactionRunner.authHeaders).
 //   fetchImpl    — fetch implementation; injected for tests (default: global fetch).
 //   timeoutMs    — client timeout (server hold + margin).
-//   query        — query string appended to /get_url (e.g. "?v=1.3.14&caps=...&client=extension").
+    //   query        — query string appended to /get_url (e.g. "?v=<version>&caps=...&client=extension").
 export async function pollGetUrl(controlUrl, { signal, authHeaders, fetchImpl = fetch, timeoutMs, query = '' } = {}) {
     if (typeof authHeaders !== 'function') { throw new Error('pollGetUrl requires an authHeaders() function'); }
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) { throw new Error('pollGetUrl requires a positive timeoutMs'); }
