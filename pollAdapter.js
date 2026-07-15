@@ -9,7 +9,7 @@
 //   - empty (204) → return true;
 //   - any other error (auth/HTTP/network) → re-throw: the controller records 'exception' and the alarm
 //     recovers on the next reconcile.
-import { POLL_REQUEST_TIMEOUT_MS, POLL_RESULT, pollGetUrl } from './pollTransport.js';
+import { POLL_REQUEST_TIMEOUT_MS, POLL_RESULT, pollGetUrl, withPollCategory } from './pollTransport.js';
 
 export function makePollOnce({
     authHeaders,
@@ -31,16 +31,26 @@ export function makePollOnce({
             throw err;   // external abort → controller sees signal.aborted; other → exception
         }
         if (!result || typeof result !== 'object') {
-            throw new Error('poll transport returned a malformed result');
+            throw withPollCategory(new Error('poll transport returned a malformed result'), 'protocol');
         }
         if (result.type === POLL_RESULT.EMPTY) { return true; }
         if (result.type !== POLL_RESULT.PAYLOAD) {
-            throw new Error(`poll transport returned unknown result type: ${String(result.type)}`);
+            throw withPollCategory(
+                new Error(`poll transport returned unknown result type: ${String(result.type)}`),
+                'protocol',
+            );
         }
         if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
-            throw new Error('poll transport returned a payload without an object body');
+            throw withPollCategory(
+                new Error('poll transport returned a payload without an object body'),
+                'protocol',
+            );
         }
-        await dispatch(result.data, controlUrl);
+        try {
+            await dispatch(result.data, controlUrl);
+        } catch (error) {
+            throw withPollCategory(error, 'dispatch');
+        }
         return true;
     };
 }

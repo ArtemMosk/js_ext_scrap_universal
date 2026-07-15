@@ -44,6 +44,19 @@ test('payload → dispatch is called then pollOnce returns true', async () => {
     assert.deepEqual(dispatched, { url: 'x' });
 });
 
+test('dispatch failure is classified at the adapter boundary', async () => {
+    const pollOnce = makePollOnce({
+        authHeaders,
+        timeoutMs: 100,
+        dispatch: async () => { throw new Error('handler failed'); },
+        pollGetUrlImpl: async () => ({ type: 'payload', data: { url: 'x' } }),
+    });
+    await assert.rejects(
+        pollOnce('http://c', { signal: new AbortController().signal }),
+        (error) => /handler failed/.test(error.message) && error.pollCategory === 'dispatch',
+    );
+});
+
 test('empty (204) → pollOnce returns true, no dispatch', async () => {
     let dispatchCalls = 0;
     const pollOnce = makePollOnce({ authHeaders, timeoutMs: 100, dispatch: async () => { dispatchCalls++; }, pollGetUrlImpl: async () => ({ type: 'empty' }) });
@@ -66,7 +79,11 @@ test('malformed and unknown transport outcomes fail loud instead of dropping wor
             timeoutMs: 100,
             pollGetUrlImpl: async () => outcome,
         });
-        await assert.rejects(pollOnce('http://c', { signal: new AbortController().signal }), /malformed|unknown|without an object body/);
+        await assert.rejects(
+            pollOnce('http://c', { signal: new AbortController().signal }),
+            (error) => /malformed|unknown|without an object body/.test(error.message) &&
+                error.pollCategory === 'protocol',
+        );
     }
 });
 

@@ -78,6 +78,7 @@ test('POISON: a poll exception clears the run (not poisoned); a later setDesired
     assert.equal(ctl.isPolling(), false, 'run must be cleared after an exception, not poisoned');
     assert.equal(exits.events[0].reason, 'exception');
     assert.equal(exits.events[0].error, 'storage unavailable (injected)');
+    assert.equal(exits.events[0].errorCategory, 'runtime');
     assert.equal(calls, 1);
 
     ctl.setDesired({ controlUrl: 'A' });        // simulate the recovery alarm

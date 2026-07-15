@@ -30,12 +30,30 @@ test('200 → PAYLOAD result with decoded data', async () => {
 
 test('non-OK status throws (surfaced, not swallowed)', async () => {
     const fetchImpl = async () => ({ status: 401, ok: false });
-    await assert.rejects(pollGetUrl('http://c', { authHeaders, fetchImpl, timeoutMs: 5000 }), /HTTP 401/);
+    await assert.rejects(
+        pollGetUrl('http://c', { authHeaders, fetchImpl, timeoutMs: 5000 }),
+        (error) => /HTTP 401/.test(error.message) && error.pollCategory === 'http',
+    );
 });
 
 test('network error propagates', async () => {
     const fetchImpl = async () => { throw new Error('network down'); };
-    await assert.rejects(pollGetUrl('http://c', { authHeaders, fetchImpl, timeoutMs: 5000 }), /network down/);
+    await assert.rejects(
+        pollGetUrl('http://c', { authHeaders, fetchImpl, timeoutMs: 5000 }),
+        (error) => /network down/.test(error.message) && error.pollCategory === 'network',
+    );
+});
+
+test('invalid JSON is classified as protocol evidence', async () => {
+    const fetchImpl = async () => ({
+        status: 200,
+        ok: true,
+        json: async () => { throw new SyntaxError('bad json'); },
+    });
+    await assert.rejects(
+        pollGetUrl('http://c', { authHeaders, fetchImpl, timeoutMs: 5000 }),
+        (error) => /bad json/.test(error.message) && error.pollCategory === 'protocol',
+    );
 });
 
 test('EXTERNAL abort → AbortError with reason "external" (stop/reconfigure, NOT a timeout)', async () => {
@@ -55,7 +73,10 @@ test('TIMEOUT → AbortError with reason "timeout" (triggers a replacement poll 
 test('auth failure fails loud (authHeaders rejection propagates)', async () => {
     const badAuth = async () => { throw new Error('storage unavailable'); };
     const fetchImpl = async () => ({ status: 204, ok: false });
-    await assert.rejects(pollGetUrl('http://c', { authHeaders: badAuth, fetchImpl, timeoutMs: 5000 }), /storage unavailable/);
+    await assert.rejects(
+        pollGetUrl('http://c', { authHeaders: badAuth, fetchImpl, timeoutMs: 5000 }),
+        (error) => /storage unavailable/.test(error.message) && error.pollCategory === 'auth',
+    );
 });
 
 // codex finding 1: cancellation must cover the (non-abortable) authHeaders read, and a real auth

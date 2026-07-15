@@ -12,6 +12,21 @@
 export const POLL_RESULT = Object.freeze({ EMPTY: 'empty', PAYLOAD: 'payload' });
 export const POLL_REQUEST_TIMEOUT_MS = 27_000;
 
+export function withPollCategory(error, pollCategory) {
+    const source = error instanceof Error ? error : new Error(String(error));
+    try {
+        Object.defineProperty(source, 'pollCategory', {
+            value: pollCategory,
+            configurable: true,
+        });
+        return source;
+    } catch (_) {
+        const wrapped = new Error(source.message);
+        wrapped.pollCategory = pollCategory;
+        return wrapped;
+    }
+}
+
 // deps:
 //   signal       — external AbortSignal (from the poll run); optional.
 //   authHeaders  — async () => headers; injected (prod: interactionRunner.authHeaders).
@@ -47,11 +62,16 @@ export async function pollGetUrl(controlUrl, { signal, authHeaders, fetchImpl = 
             authHeaders().then((headers) => ({ headers }), (error) => ({ error })),
             cancellation(),
         ]);
-        if (authOutcome.error) { throw authOutcome.error; }                    // fail loud (real auth failure)
+        if (authOutcome.error) { throw withPollCategory(authOutcome.error, 'auth'); }
         const response = await fetchImpl(`${controlUrl}/get_url${query}`, { headers: authOutcome.headers, signal: controller.signal });
         if (response.status === 204) { return { type: POLL_RESULT.EMPTY }; }
-        if (!response.ok) { throw new Error(`get_url HTTP ${response.status}`); }
-        const data = await response.json();
+        if (!response.ok) { throw withPollCategory(new Error(`get_url HTTP ${response.status}`), 'http'); }
+        let data;
+        try {
+            data = await response.json();
+        } catch (error) {
+            throw withPollCategory(error, 'protocol');
+        }
         return { type: POLL_RESULT.PAYLOAD, data };
     } catch (err) {
         // Normalize OUR abort (native fetch AbortError or the cancellation racer) to carry a distinct
@@ -59,7 +79,7 @@ export async function pollGetUrl(controlUrl, { signal, authHeaders, fetchImpl = 
         if (err && err.name === 'AbortError' && controller.signal.aborted && abortReason) {
             throw makeAbortError(abortReason);
         }
-        throw err;
+        throw err?.pollCategory ? err : withPollCategory(err, 'network');
     } finally {
         clearTimeout(timer);
         if (signal) { signal.removeEventListener('abort', onExternalAbort); }

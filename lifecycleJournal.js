@@ -3,6 +3,9 @@
 
 const ALLOWED_TEXT = new Set(['event', 'reason', 'at']);
 const ALLOWED_NUMBER = new Set(['generation', 'revision', 'storageBytes']);
+const ALLOWED_ERROR_CATEGORIES = new Set([
+    'auth', 'http', 'network', 'protocol', 'dispatch', 'runtime',
+]);
 
 export class LifecycleJournal {
     constructor({
@@ -67,6 +70,8 @@ function sanitizeRecord(raw, sessionId) {
     for (const [key, value] of Object.entries(raw)) {
         if (ALLOWED_TEXT.has(key) && typeof value === 'string') {
             record[key] = value.slice(0, 160);
+        } else if (key === 'errorCategory' && ALLOWED_ERROR_CATEGORIES.has(value)) {
+            record.errorCategory = value;
         } else if (ALLOWED_NUMBER.has(key) && Number.isFinite(value)) {
             record[key] = value;
         }

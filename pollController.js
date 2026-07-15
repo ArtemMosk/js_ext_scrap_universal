@@ -22,10 +22,15 @@
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} };
 const NOOP_EXIT_SINK = () => {};
 const MAX_ERROR_LEN = 300;
+const POLL_ERROR_CATEGORIES = new Set(['auth', 'http', 'network', 'protocol', 'dispatch']);
 
 function boundedError(message) {
     if (typeof message !== 'string') { return null; }
     return message.length > MAX_ERROR_LEN ? message.slice(0, MAX_ERROR_LEN) + '…' : message;
+}
+
+function safeErrorCategory(error) {
+    return POLL_ERROR_CATEGORIES.has(error?.pollCategory) ? error.pollCategory : 'runtime';
 }
 
 export class PollController {
@@ -134,6 +139,7 @@ export class PollController {
     async _pollLoop(run) {
         let exitReason = this._stopReason();
         let errorMessage = null;
+        let errorCategory = null;
         try {
             while (this._run === run && !run.stopping) {
                 let shouldContinue;
@@ -145,6 +151,7 @@ export class PollController {
                     // next alarm→setDesired can relaunch. The loop does NOT self-relaunch (no spin).
                     exitReason = 'exception';
                     errorMessage = boundedError(err && err.message);
+                    errorCategory = safeErrorCategory(err);
                     this._logger.error('poll loop threw — clearing run so the alarm can recover', {
                         generation: run.generation, error: errorMessage, stack: err && err.stack,
                     });
@@ -166,6 +173,7 @@ export class PollController {
                 generation: run.generation,
                 reason: exitReason,
                 error: errorMessage,
+                errorCategory,
                 at: new Date().toISOString(),
             });
         }

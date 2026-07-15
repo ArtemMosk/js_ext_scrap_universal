@@ -20,6 +20,7 @@ test('journal stores only bounded lifecycle fields and excludes secrets/page dat
     await journal.append('poll_exit', {
         generation: 7,
         reason: 'exception',
+        errorCategory: 'auth',
         error: 'token=secret http://private.test/chat',
         controlUrl: 'http://private.test',
         dom: '<html>secret</html>',
@@ -31,9 +32,18 @@ test('journal stores only bounded lifecycle fields and excludes secrets/page dat
         at: storage.values.pollLifecycleJournal[0].at,
         generation: 7,
         reason: 'exception',
+        errorCategory: 'auth',
         storageBytes: 321,
     }]);
     assert.doesNotMatch(JSON.stringify(storage.values), /secret|private\.test|html|screenshot/);
+});
+
+test('journal accepts only the fixed error-category enum', async () => {
+    const storage = storageHarness();
+    const journal = new LifecycleJournal({ storage, sessionId: 'session-1' });
+    await journal.append('poll_exit', { errorCategory: 'secret http://private.test' });
+    assert.equal(storage.values.pollLifecycleJournal[0].errorCategory, undefined);
+    assert.doesNotMatch(JSON.stringify(storage.values), /secret|private\.test/);
 });
 
 test('journal is bounded and preserves append order', async () => {
