@@ -1,5 +1,14 @@
 import Logger from './logger.js';
 
+const DEFAULT_CONTENT_SCREENSHOT_TIMEOUT_MS = 30000;
+const DEFAULT_SCREENSHOT_IPC_MARGIN_MS = 5000;
+
+function boundedPositiveMs(value, fallback, min = 50) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.max(min, n);
+}
+
 // Message handler for screenshot capture requests
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "captureVisibleTab") {
@@ -30,15 +39,24 @@ export default class ScreenshotCapture {
     }
 
     async captureFullPage(tabId, options = {}) {
-        const timeoutMs = Number.isFinite(Number(options.timeoutMs))
-            ? Math.max(1, Number(options.timeoutMs))
-            : 35000;
+        const contentTimeoutMs = boundedPositiveMs(
+            options.contentTimeoutMs ?? options.timeoutMs,
+            DEFAULT_CONTENT_SCREENSHOT_TIMEOUT_MS
+        );
+        const ipcMarginMs = boundedPositiveMs(
+            options.ipcMarginMs,
+            DEFAULT_SCREENSHOT_IPC_MARGIN_MS,
+            0
+        );
+        const raceTimeoutMs = Number.isFinite(Number(options.raceTimeoutMs))
+            ? Math.max(contentTimeoutMs, Number(options.raceTimeoutMs))
+            : contentTimeoutMs + ipcMarginMs;
         let timeoutId = null;
         try {
             const capture = new Promise((resolve, reject) => {
                 chrome.tabs.sendMessage(
                     tabId,
-                    { action: "takeScreenshot", timeoutMs },
+                    { action: "takeScreenshot", timeoutMs: contentTimeoutMs },
                     async (response) => {
                     if (chrome.runtime.lastError) {
                         this.logger.error('Screenshot capture failed', { 
@@ -95,8 +113,8 @@ export default class ScreenshotCapture {
             });
             const timeout = new Promise((_, reject) => {
                 timeoutId = setTimeout(() => {
-                    reject(new Error(`Screenshot capture timed out after ${timeoutMs}ms`));
-                }, timeoutMs);
+                    reject(new Error(`Screenshot capture timed out after ${raceTimeoutMs}ms`));
+                }, raceTimeoutMs);
             });
             return await Promise.race([capture, timeout]);
         } catch (error) {

@@ -1,12 +1,14 @@
 // popup.js
 document.addEventListener('DOMContentLoaded', async () => {
-    // Load saved settings from sync storage
-    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval', 'apiToken']);
+    // Config lives in sync (convenient across devices); the bearer TOKEN lives in LOCAL only —
+    // it must never replicate to the user's Google account / other Chrome profiles.
+    const settings = await chrome.storage.sync.get(['controlUrl', 'pollInterval']);
+    const { apiToken } = await chrome.storage.local.get(['apiToken']);
     if (settings.controlUrl) {
         document.getElementById('control-url').value = settings.controlUrl;
     }
-    if (settings.apiToken) {
-        document.getElementById('api-token').value = settings.apiToken;
+    if (apiToken) {
+        document.getElementById('api-token').value = apiToken;
     }
     if (settings.pollInterval) {
         document.getElementById('poll-interval').value = settings.pollInterval;
@@ -99,11 +101,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
 
             const apiToken = document.getElementById('api-token').value.trim();
-            await chrome.storage.sync.set({
-                controlUrl,
-                pollInterval,
-                apiToken
-            });
+            await chrome.storage.sync.set({ controlUrl, pollInterval });
+            await chrome.storage.local.set({ apiToken });   // token: LOCAL only
+            await chrome.storage.sync.remove('apiToken');   // never leave a copy in the cloud
 
             document.getElementById('status').textContent = 'Settings saved successfully';
         } catch (error) {
@@ -127,13 +127,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        // Persist settings before starting — INCLUDING the API token, or an authed server 401s
-        // every poll (the token field is read from storage.sync by authHeaders on each request).
-        await chrome.storage.sync.set({
-            controlUrl,
-            pollInterval,
-            apiToken
-        });
+        // Persist before starting. Config → sync; the API token → LOCAL only (or an authed server
+        // 401s every poll; authHeaders reads the token from storage.local on each request).
+        await chrome.storage.sync.set({ controlUrl, pollInterval });
+        await chrome.storage.local.set({ apiToken });
+        await chrome.storage.sync.remove('apiToken');
 
         chrome.runtime.sendMessage({ 
             type: "start_polling",
@@ -170,7 +168,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         try {
-            await chrome.storage.sync.clear();
+            const response = await new Promise((resolve, reject) => {
+                chrome.runtime.sendMessage({ type: 'clear_settings' }, (result) => {
+                    if (chrome.runtime.lastError) {
+                        reject(new Error(chrome.runtime.lastError.message));
+                    } else {
+                        resolve(result);
+                    }
+                });
+            });
+            if (!response || !response.status || response.status.startsWith('Error:')) {
+                throw new Error(response?.status || 'background reset did not respond');
+            }
             document.getElementById('control-url').value = '';
             document.getElementById('poll-interval').value = '30';
             document.getElementById('api-token').value = '';

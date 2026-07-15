@@ -157,7 +157,7 @@ test('failure evidence screenshot timeout still submits DOM evidence', async () 
     assert.deepEqual(calls, ['failing-type', 'screenshot-hung', 'probe']);
     assert.equal(submitted.status, 'failed');
     assert.match(submitted.metadata.evidence.failure.capture_errors[0],
-                 /Screenshot capture timed out after 10ms/);
+                 /Screenshot capture timed out after 2050ms/);
     assert.equal(submitted.metadata.evidence.failure.dom, '{"dom":true}');
 });
 

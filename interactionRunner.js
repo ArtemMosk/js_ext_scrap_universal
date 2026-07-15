@@ -14,6 +14,7 @@ const MAX_TASK_TIMEOUT_SEC = 480; // matches the 8-minute processing ceiling in 
 const HEARTBEAT_INTERVAL_MS = 30000;
 const CONTENT_STEP_TIMEOUT_MS = 15000;
 const MAX_CONTENT_STEP_TIMEOUT_MS = 60000;
+const EXTRACT_IMAGE_ENCODE_MARGIN_MS = 10000;
 const FAILURE_SCREENSHOT_TIMEOUT_MS = 8000;
 const FAILURE_STEP_TIMEOUT_MS = 3000;
 
@@ -24,20 +25,29 @@ function sleep(ms) {
 // Re-fetch an image from the background service worker (host_permissions bypass the
 // CORS restriction a content-script fetch hits on cross-origin CDN images).
 // Service workers have no FileReader, so base64-encode the ArrayBuffer manually.
-async function backgroundFetchImage(src) {
-    const resp = await fetch(src);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const buf = await resp.arrayBuffer();
-    const MAX = 20 * 1024 * 1024;
-    if (buf.byteLength > MAX) throw new Error(`image ${buf.byteLength}B exceeds ${MAX}B cap`);
-    const mime = (resp.headers.get('content-type') || 'image/png').split(';')[0];
-    const bytes = new Uint8Array(buf);
-    let binary = '';
-    const CHUNK = 0x8000;
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+export async function backgroundFetchImage(src, timeoutMs = CONTENT_STEP_TIMEOUT_MS) {
+    const limitMs = boundedTimeoutMs(timeoutMs, CONTENT_STEP_TIMEOUT_MS);
+    const controller = new AbortController();
+    const fetchAndEncode = (async () => {
+        const resp = await fetch(src, { signal: controller.signal });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        const MAX = 20 * 1024 * 1024;
+        if (buf.byteLength > MAX) throw new Error(`image ${buf.byteLength}B exceeds ${MAX}B cap`);
+        const mime = (resp.headers.get('content-type') || 'image/png').split(';')[0];
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+        }
+        return { dataUrl: `data:${mime};base64,${btoa(binary)}`, mime, bytes: buf.byteLength };
+    })();
+    try {
+        return await withTimeout(fetchAndEncode, limitMs, 'background image fetch');
+    } finally {
+        controller.abort();
     }
-    return { dataUrl: `data:${mime};base64,${btoa(binary)}`, mime, bytes: buf.byteLength };
 }
 
 class StepError extends Error {
@@ -54,10 +64,13 @@ function boundedTimeoutMs(value, fallback, max = MAX_CONTENT_STEP_TIMEOUT_MS) {
     return Math.max(50, Math.min(max, n));
 }
 
-function responseTimeoutMs(step, overrideMs) {
+export function responseTimeoutMs(step, overrideMs) {
     if (overrideMs !== undefined) return boundedTimeoutMs(overrideMs, CONTENT_STEP_TIMEOUT_MS);
     if (step && step.response_timeout_ms !== undefined) {
         return boundedTimeoutMs(step.response_timeout_ms, CONTENT_STEP_TIMEOUT_MS);
+    }
+    if (step && step.action === 'extractImage') {
+        return boundedTimeoutMs((step.wait_ms || 12000) + EXTRACT_IMAGE_ENCODE_MARGIN_MS, 22000);
     }
     if (step && step.action === 'uploadFile') {
         return boundedTimeoutMs((step.verify_timeout_ms || 15000) + 5000, 20000);
@@ -82,7 +95,7 @@ async function withTimeout(promise, timeoutMs, label) {
     }
 }
 
-async function sendStep(tabId, step, timeoutMs) {
+export async function sendStep(tabId, step, timeoutMs) {
     const limitMs = responseTimeoutMs(step, timeoutMs);
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
@@ -110,6 +123,10 @@ async function sendStep(tabId, step, timeoutMs) {
         }
     }
     throw new Error('content script unreachable after 3 injection attempts');
+}
+
+export function failureScreenshotTimeoutMs(value) {
+    return boundedTimeoutMs(value, FAILURE_SCREENSHOT_TIMEOUT_MS, FAILURE_SCREENSHOT_TIMEOUT_MS);
 }
 
 // Trace frames are bounded — debug must not turn the result store into a byte sink.
@@ -274,21 +291,42 @@ export function deriveAttemptBudget(timeoutMs, maxRetries, stopMarginMs = 20000)
 
 // Optional bearer auth (server deployments that set API_BEARER_TOKEN): the token is configured
 // in the popup and MUST ride on every server call, or an authed server 401s the whole loop.
+// The token lives in chrome.storage.LOCAL, never sync — a bearer token that drives the user's
+// ChatGPT account must not replicate to their Google account / other Chrome profiles.
 export async function authHeaders(extra = {}) {
+    // B-M0-2 fail-loud: a storage-read failure must NOT degrade into an UNauthenticated request
+    // (that would 401-loop invisibly against an authed server). Let the error propagate — pollServer
+    // / submit callers already catch it and stop, surfacing the fault instead of silently dropping auth.
+    let apiToken;
     try {
-        const { apiToken } = await chrome.storage.sync.get(['apiToken']);
-        return apiToken ? { ...extra, 'Authorization': `Bearer ${apiToken}` } : extra;
-    } catch (_) {
-        return extra;
+        ({ apiToken } = await chrome.storage.local.get(['apiToken']));
+    } catch (e) {
+        runnerLogger.error('auth token read from local storage failed — refusing to send an '
+            + 'unauthenticated request', { error: e && e.message });
+        throw e;
+    }
+    return apiToken ? { ...extra, 'Authorization': `Bearer ${apiToken}` } : extra;
+}
+
+
+// One heartbeat tick. Extracted + exported so the fire-and-forget path is testable.
+// B-M0-2: `authHeaders()` now REJECTS on a storage fault. Awaiting it *inside* this try (not as a
+// fetch() argument) is what makes the rejection observable — the old `fetch(url, {headers: await
+// authHeaders()}).catch()` attached its .catch to a fetch call that was never reached when the
+// argument await threw, so the rejection escaped the setInterval callback as an unhandled rejection.
+// The heartbeat is a best-effort keepalive: a failed beat warns (the auth-critical poll/submit paths
+// fail loud and stop on their own), so catching here is correct, not swallowed control flow.
+export async function sendHeartbeat(controlUrl, taskId) {
+    try {
+        const headers = await authHeaders();
+        await fetch(`${controlUrl}/task_heartbeat/${taskId}`, { method: 'POST', headers });
+    } catch (error) {
+        runnerLogger.warn('Heartbeat failed', { taskId, error: error && error.message });
     }
 }
 
 function startHeartbeat(controlUrl, taskId) {
-    return setInterval(async () => {
-        fetch(`${controlUrl}/task_heartbeat/${taskId}`,
-              { method: 'POST', headers: await authHeaders() })
-            .catch(error => runnerLogger.warn('Heartbeat failed', { taskId, error: error.message }));
-    }, HEARTBEAT_INTERVAL_MS);
+    return setInterval(() => sendHeartbeat(controlUrl, taskId), HEARTBEAT_INTERVAL_MS);
 }
 
 async function submitResult(controlUrl, result) {
@@ -599,12 +637,21 @@ export async function runInteractionTask(task, controlUrl, deps) {
                         break;
                     }
                     case 'extractImage': {
-                        const res = await sendStep(tabId, step);
+                        const extractBudgetMs = Math.min(
+                            responseTimeoutMs(step),
+                            remainingMs(deadline, i, step)
+                        );
+                        const extractStarted = Date.now();
+                        const res = await sendStep(tabId, step, extractBudgetMs);
                         if (!res.ok) throw new StepError(i, step, res.error);
                         let d = res.data;
                         if (d.needsBackgroundFetch && d.src_url) {
                             try {
-                                const bg = await backgroundFetchImage(d.src_url);
+                                const bgTimeoutMs = Math.min(
+                                    Math.max(50, extractBudgetMs - (Date.now() - extractStarted)),
+                                    remainingMs(deadline, i, step)
+                                );
+                                const bg = await backgroundFetchImage(d.src_url, bgTimeoutMs);
                                 d = { ...d, ...bg, needsBackgroundFetch: false };
                             } catch (bgErr) {
                                 throw new StepError(i, step, `image fetch failed (page + background): ${bgErr.message}`);
@@ -698,20 +745,17 @@ export async function runInteractionTask(task, controlUrl, deps) {
         // 2. Pre-cancel evidence (opt-in): screenshot + DOM of the ACTUAL failure state.
         const evidence = { task_id: task.task_id, captured_at: new Date().toISOString() };
         let debug = null;
+        const failureStepTimeoutMs = boundedTimeoutMs(
+            params.debug_step_timeout_ms,
+            FAILURE_STEP_TIMEOUT_MS,
+            15000
+        );
         if (params.debug_on_failure && tabId !== null) {
             const failure = { capture_errors: [] };
-            const screenshotTimeoutMs = Math.min(
-                Math.max(1, Number(params.debug_screenshot_timeout_ms) || FAILURE_SCREENSHOT_TIMEOUT_MS),
-                FAILURE_SCREENSHOT_TIMEOUT_MS
-            );
-            const failureStepTimeoutMs = boundedTimeoutMs(
-                params.debug_step_timeout_ms,
-                FAILURE_STEP_TIMEOUT_MS,
-                15000
-            );
+            const screenshotTimeoutMs = failureScreenshotTimeoutMs(params.debug_screenshot_timeout_ms);
             try {
                 failure.screenshot = await new ScreenshotCapture().captureFullPage(
-                    tabId, { timeoutMs: screenshotTimeoutMs });
+                    tabId, { timeoutMs: screenshotTimeoutMs, ipcMarginMs: 2000 });
             }
             catch (e) { failure.capture_errors.push(`screenshot: ${e.message}`); }
             try {
@@ -725,11 +769,6 @@ export async function runInteractionTask(task, controlUrl, deps) {
         // 3. FM3 cancel-on-abandon: the site runs ONE generation job per account — a job we
         // abandon must be stopped, or it silently blocks every later request. Best-effort.
         if (tabId !== null && params.cancel_selector) {
-            const failureStepTimeoutMs = boundedTimeoutMs(
-                params.debug_step_timeout_ms,
-                FAILURE_STEP_TIMEOUT_MS,
-                15000
-            );
             try {
                 await sendStep(tabId, { action: 'click', selector: params.cancel_selector }, failureStepTimeoutMs);
                 runnerLogger.warn('cancel-on-abandon: stop control clicked', { taskId: task.task_id });
